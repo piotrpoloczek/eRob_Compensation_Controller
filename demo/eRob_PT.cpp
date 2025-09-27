@@ -202,13 +202,22 @@ OSAL_THREAD_FUNC_RT ecat_thread(void *ptr)
                 for (int slave = 1; slave <= ec_slavecount; slave++)
                 {
                     memcpy(&txpdo, ec_slave[slave].inputs, sizeof(txpdo_t));
+
                     // check slave state
                     if (ec_slave[slave].state != EC_STATE_OPERATIONAL)
                     {
-                        ECAT_LOG("Warning: Slave %d not in OPERATIONAL state (State: 0x%02x)\n",  slave, ec_slave[slave].state);
+                        ECAT_LOG("Warning: Slave %d not in OPERATIONAL state (State: 0x%02x)\n",
+                                slave, ec_slave[slave].state);
                         ec_slave[slave].state = EC_STATE_OPERATIONAL;
                         ec_writestate(slave);
                     }
+
+                    // ---- read torque sensor values every cycle ----
+                    double torque_Nm   = txpdo.torque_mN_m / 1000.0;  // mN·m → N·m
+                    double ratio_percent = txpdo.torque_ratio_pm / 10.0;
+
+                    ECAT_LOG("Slave %d: Torque sensor = %.3f N·m (raw %d mN·m), Ratio = %.1f%%\n",
+                            slave, torque_Nm, txpdo.torque_mN_m, ratio_percent);
                 }
 
                 // state machine control
@@ -606,14 +615,26 @@ int erob_map_txpod(void)
         map_object = 0x60770010;
         retval += ec_SDOwrite(i, 0x1A00, 0x04, FALSE, sizeof(map_object), &map_object, EC_TIMEOUTSAFE);
 
+        // After Actual Torque (0x6077:0, 16 bits)
+        map_object = 0x3B690020;  // 0x3B69:0 Torque sensor value, DINT, 32 bits (mN·m)
+        retval += ec_SDOwrite(i, 0x1A00, 0x05, FALSE, sizeof(map_object), &map_object, EC_TIMEOUTSAFE);
+
+        map_object = 0x3B6A0010;  // 0x3B6A:0 Torque sensor ratio, INT, 16 bits (0.1 %)
+        retval += ec_SDOwrite(i, 0x1A00, 0x06, FALSE, sizeof(map_object), &map_object, EC_TIMEOUTSAFE);
+
+
         // // 电流基值 额定电流mA (0x6075:0, uint16_t) 对应上位机安全电源界面：持续电流。电机额定电流，它取自电机基本参数。
         // 读取不到，有空再分析，先直接设置
         // map_object = 0x60750010;
         // retval += ec_SDOwrite(i, 0x1A00, 0x05, FALSE, sizeof(map_object), &map_object, EC_TIMEOUTSAFE);
 
         // Set the number of mapped objects (5 objects)
-        uint8 map_count = 4;
+        // Update mapped count (we now have 6 entries)
+        uint8 map_count = 6;       // or 7 if you also mapped 0x6076
         retval += ec_SDOwrite(i, 0x1A00, 0x00, FALSE, sizeof(map_count), &map_count, EC_TIMEOUTSAFE);
+
+        // uint8 map_count = 4;
+        // retval += ec_SDOwrite(i, 0x1A00, 0x00, FALSE, sizeof(map_count), &map_count, EC_TIMEOUTSAFE);
 
         // Configure TXPDO assignment
         // First, clear the assignment
