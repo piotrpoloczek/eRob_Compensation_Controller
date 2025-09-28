@@ -34,6 +34,12 @@
 #include <fcntl.h>  //  include F_GETFL and F_SETFL definitions
 #include "log.h"
 #include "motor_control.h"
+#include "torque_pkt.h"
+#include "udp_pub.h"
+
+
+// --- add this line ---
+static UdpPub g_pub;   // global UDP publisher
 
 // Define constants for stack size and timing
 #define stack64k (64 * 1024) // Stack size for threads
@@ -112,6 +118,11 @@ int main(int argc, char **argv)
     start_ecatthread_thread = FALSE;
     dorun = 0;
     ctime_thread = 1000;  // set cycle time to us
+
+    // initialize the udp port for sending the torque sensor data
+    g_pub.init("127.0.0.1", 9999);
+
+
     // set highest real-time priority
     struct sched_param param;
     param.sched_priority = 99;
@@ -223,6 +234,8 @@ OSAL_THREAD_FUNC_RT ecat_thread(void *ptr)
                     /* copy this slave's inputs */
                     memcpy(&txpdo, ec_slave[slave].inputs, sizeof(txpdo_t));
 
+                    
+
                     /* keep slave in OP */
                     if (ec_slave[slave].state != EC_STATE_OPERATIONAL) {
                         ECAT_LOG("Warning: Slave %d not in OPERATIONAL state (0x%02x)\n",
@@ -234,6 +247,10 @@ OSAL_THREAD_FUNC_RT ecat_thread(void *ptr)
                     /* read torque every cycle */
                     const double torque_Nm     = txpdo.torque_mN_m / 1000.0;   // mN·m → N·m
                     const double ratio_percent = txpdo.torque_ratio_pm / 10.0; // 0.1% → %
+
+                    g_pub.send_sample((uint16_t)slave,
+                        (int32_t)txpdo.torque_mN_m,
+                        (int16_t)txpdo.torque_ratio_pm);
 
                     /* (optional) downsample console prints */
                     if ((g_csv_decim % 10) == 0) {

@@ -1,0 +1,225 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Torque stream</title>
+  <style>
+    :root{--pad:16px}
+    body{font:14px system-ui;margin:2rem;max-width:1100px}
+    h1{margin:0 0 .5rem 0}
+    #status{margin:.5rem 0;color:#666}
+    table{border-collapse:collapse;margin-top:1rem}
+    td,th{border:1px solid #ccc;padding:.35rem .6rem;text-align:right}
+    th:nth-child(1), td:nth-child(1){text-align:center}
+    .row{display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap}
+    .panel{flex:1 1 640px;min-width:380px}
+    #controls{display:flex;gap:12px;align-items:center;margin:.5rem 0}
+    button,input,select{font:inherit}
+    canvas{display:block;border:1px solid #ddd;border-radius:8px;background:#fff}
+    .legend{display:flex;gap:12px;flex-wrap:wrap;margin:.5rem 0}
+    .badge{display:inline-flex;align-items:center;gap:6px;border:1px solid #ddd;border-radius:999px;padding:2px 8px}
+    .dot{width:10px;height:10px;border-radius:50%}
+  </style>
+</head>
+<body>
+  <h1>Torque (UDP → WebSocket)</h1>
+  <div id="status">connecting…</div>
+
+  <div class="row">
+    <div class="panel">
+      <div id="controls">
+        <label>Window:
+          <select id="window">
+            <option value="5">5 s</option>
+            <option value="10" selected>10 s</option>
+            <option value="30">30 s</option>
+            <option value="60">60 s</option>
+          </select>
+        </label>
+        <label>Y auto-scale:
+          <input type="checkbox" id="autoscale" checked>
+        </label>
+        <label>Y max [N·m]:
+          <input type="number" id="ymax" step="0.1" value="5.0" style="width:6em">
+        </label>
+        <button id="pause">Pause</button>
+        <button id="clear">Clear</button>
+      </div>
+      <canvas id="chart" width="960" height="360"></canvas>
+      <div class="legend" id="legend"></div>
+    </div>
+
+    <div class="panel">
+      <table id="tbl">
+        <thead><tr><th>Slave</th><th>Torque [N·m]</th><th>Ratio [%]</th><th>seq</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+/* ---------- WebSocket intake ---------- */
+const statusEl = document.getElementById('status');
+const tbody = document.querySelector('#tbl tbody');
+const ws = new WebSocket(`ws://${location.host}/stream`);
+ws.onopen  = ()=> statusEl.textContent = 'connected, waiting for data…';
+ws.onclose = ()=> statusEl.textContent = 'disconnected';
+
+const buffers = new Map(); // slave -> [{t, y}]
+const latest  = new Map(); // slave -> {seq, torque_Nm, ratio_percent, t_ms}
+let paused = false;
+
+ws.onmessage = ev => {
+  const msg = JSON.parse(ev.data);
+  if (!msg.samples) return;
+  const now = performance.now(); // ms, monotonic (client)
+  for (const s of msg.samples) {
+    latest.set(s.slave, { ...s, t_ms: now });
+    if (!buffers.has(s.slave)) buffers.set(s.slave, []);
+    const buf = buffers.get(s.slave);
+    buf.push({ t: now, y: s.torque_Nm });
+  }
+  // prune to window
+  pruneOld();
+  renderTable();
+  statusEl.textContent = `last update: ${new Date().toLocaleTimeString()}`;
+};
+
+/* ---------- Controls ---------- */
+const windowSel = document.getElementById('window');
+const autoscale = document.getElementById('autoscale');
+const ymaxInput = document.getElementById('ymax');
+document.getElementById('pause').onclick = () => paused = !paused;
+document.getElementById('clear').onclick = () => { buffers.clear(); latest.clear(); };
+autoscale.onchange = () => { ymaxInput.disabled = autoscale.checked; };
+autoscale.dispatchEvent(new Event('change'));
+
+/* ---------- Plotting ---------- */
+const canvas = document.getElementById('chart');
+const ctx = canvas.getContext('2d');
+
+function colorForSlave(slave) {
+  // deterministic HSL → canvas rgb
+  const h = (slave * 67) % 360;
+  ctx.save();
+  ctx.fillStyle = `hsl(${h} 70% 45%)`;
+  const c = ctx.fillStyle;
+  ctx.restore();
+  return c;
+}
+
+function pruneOld() {
+  const spanSec = parseFloat(windowSel.value);
+  const cutoff = performance.now() - spanSec * 1000;
+  for (const [slave, buf] of buffers) {
+    while (buf.length && buf[0].t < cutoff) buf.shift();
+    if (buf.length === 0) buffers.delete(slave);
+  }
+}
+
+function computeYRange() {
+  let min = +Infinity, max = -Infinity;
+  for (const buf of buffers.values()) {
+    for (const p of buf) { if (p.y < min) min = p.y; if (p.y > max) max = p.y; }
+  }
+  if (!isFinite(min) || !isFinite(max)) { min = -1; max = 1; }
+  if (autoscale.checked) {
+    const pad = (max - min) * 0.1 || 0.5;
+    return { min: min - pad, max: max + pad };
+  } else {
+    const ymax = parseFloat(ymaxInput.value) || 5.0;
+    return { min: -ymax, max: ymax };
+  }
+}
+
+function renderTable() {
+  const rows = [...latest.values()].sort((a,b)=>a.slave-b.slave);
+  tbody.innerHTML = '';
+  for (const s of rows) {
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      `<td>S${s.slave}</td>`+
+      `<td>${s.torque_Nm.toFixed(3)}</td>`+
+      `<td>${s.ratio_percent.toFixed(1)}</td>`+
+      `<td>${s.seq}</td>`;
+    tbody.appendChild(tr);
+  }
+  // legend
+  const legend = document.getElementById('legend');
+  legend.innerHTML = '';
+  for (const s of rows) {
+    const div = document.createElement('div');
+    div.className = 'badge';
+    div.innerHTML = `<span class="dot" style="background:${colorForSlave(s.slave)}"></span> S${s.slave}`;
+    legend.appendChild(div);
+  }
+}
+
+function draw() {
+  if (!paused) pruneOld();
+
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0,0,W,H);
+
+  // paddings
+  const L = 50, R = 10, T = 12, B = 24;
+  ctx.fillStyle = '#000';
+  ctx.font = '12px system-ui';
+
+  // axes
+  ctx.strokeStyle = '#ddd'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(L, T); ctx.lineTo(L, H-B); ctx.lineTo(W-R, H-B); ctx.stroke();
+
+  // grid + labels
+  const spanSec = parseFloat(windowSel.value);
+  const now = performance.now();
+  for (let s = 0; s <= spanSec; s += spanSec <= 10 ? 1 : 5) {
+    const x = L + (W - L - R) * (1 - s/spanSec);
+    ctx.strokeStyle = '#eee';
+    ctx.beginPath(); ctx.moveTo(x, T); ctx.lineTo(x, H-B); ctx.stroke();
+    ctx.fillStyle = '#666';
+    ctx.fillText(`${s}s`, x-10, H-6);
+  }
+
+  const yr = computeYRange();
+  const yToPix = y => {
+    const n = (y - yr.min) / (yr.max - yr.min);
+    return (H - B) - n * (H - B - T);
+  };
+  // y ticks
+  const yTicks = 5;
+  for (let i=0;i<=yTicks;i++){
+    const yv = yr.min + (i*(yr.max-yr.min)/yTicks);
+    const y = yToPix(yv);
+    ctx.strokeStyle = '#f3f3f3';
+    ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(W-R, y); ctx.stroke();
+    ctx.fillStyle = '#666';
+    ctx.fillText(yv.toFixed(2), 6, y+4);
+  }
+
+  // series
+  for (const [slave, buf] of buffers) {
+    if (buf.length < 2) continue;
+    ctx.strokeStyle = colorForSlave(slave);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i=0;i<buf.length;i++){
+      const age = (now - buf[i].t)/1000;
+      const x = L + (W - L - R) * (1 - Math.min(age, spanSec)/spanSec);
+      const y = yToPix(buf[i].y);
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+  }
+
+  // labels
+  ctx.fillStyle = '#000';
+  ctx.fillText('Torque [N·m]', 6, T+10);
+  ctx.save(); ctx.translate(W-70, H-6); ctx.fillText('time →', 0, 0); ctx.restore();
+
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
