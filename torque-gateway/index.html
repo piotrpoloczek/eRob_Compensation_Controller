@@ -1,0 +1,204 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Torque stream (Plotly.js)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root{--pad:16px}
+    body{font:14px system-ui;margin:2rem;max-width:1100px}
+    h1{margin:0 0 .5rem 0}
+    #status{margin:.5rem 0;color:#666}
+    table{border-collapse:collapse;margin-top:1rem}
+    td,th{border:1px solid #ccc;padding:.35rem .6rem;text-align:right}
+    th:nth-child(1), td:nth-child(1){text-align:center}
+    .row{display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap}
+    .panel{flex:1 1 640px;min-width:380px}
+    #controls{display:flex;gap:12px;align-items:center;margin:.5rem 0;flex-wrap:wrap}
+    button,input,select{font:inherit}
+    #chart{width:960px;max-width:100%;height:380px;border:1px solid #ddd;border-radius:8px;background:#fff}
+    .legend{display:flex;gap:12px;flex-wrap:wrap;margin:.5rem 0}
+    .badge{display:inline-flex;align-items:center;gap:6px;border:1px solid #ddd;border-radius:999px;padding:2px 8px}
+    .dot{width:10px;height:10px;border-radius:50%}
+  </style>
+  <!-- Plotly: streaming-friendly and simple to manage multiple traces -->
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+</head>
+<body>
+  <h1>Torque (UDP → WebSocket) — Plotly.js</h1>
+  <div id="status">connecting…</div>
+
+  <div class="row">
+    <div class="panel">
+      <div id="controls">
+        <label>Window:
+          <select id="window">
+            <option value="5">5 s</option>
+            <option value="10" selected>10 s</option>
+            <option value="30">30 s</option>
+            <option value="60">60 s</option>
+          </select>
+        </label>
+        <label>Y auto-scale:
+          <input type="checkbox" id="autoscale" checked>
+        </label>
+        <label>Y max [N·m]:
+          <input type="number" id="ymax" step="0.1" value="5.0" style="width:6em">
+        </label>
+        <button id="pause">Pause</button>
+        <button id="clear">Clear</button>
+      </div>
+      <div id="chart"></div>
+      <div class="legend" id="legend"></div>
+    </div>
+
+    <div class="panel">
+      <table id="tbl">
+        <thead><tr><th>Slave</th><th>Torque [N·m]</th><th>Ratio [%]</th><th>seq</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+/* ---------- WebSocket intake ---------- */
+const statusEl = document.getElementById('status');
+const tbody = document.querySelector('#tbl tbody');
+const ws = new WebSocket(`ws://${location.host}/stream`);
+ws.onopen  = ()=> statusEl.textContent = 'connected, waiting for data…';
+ws.onclose = ()=> statusEl.textContent = 'disconnected';
+
+// trace index per slave
+const traces = new Map(); // slave -> traceIndex
+const latest  = new Map(); // slave -> {seq, torque_Nm, ratio_percent, t_ms}
+let paused = false;
+
+ws.onmessage = ev => {
+  const msg = JSON.parse(ev.data);
+  if (!msg.samples) return;
+  const now = Date.now();
+
+  // batch updates for performance
+  const extend = { x: [], y: [], indices: [] };
+
+  for (const s of msg.samples) {
+    latest.set(s.slave, { ...s, t_ms: now });
+
+    // ensure trace exists
+    if (!traces.has(s.slave)) addTrace(s.slave);
+
+    const idx = traces.get(s.slave);
+    if (!paused) {
+      extend.x.push([new Date(now)]);
+      extend.y.push([s.torque_Nm]);
+      extend.indices.push(idx);
+    }
+  }
+
+  if (extend.indices.length) {
+    const maxpoints = Math.ceil(parseFloat(windowSel.value) * targetHz);
+    Plotly.extendTraces(chartEl, {x: extend.x, y: extend.y}, extend.indices, maxpoints);
+  }
+
+  renderTable();
+  statusEl.textContent = `last update: ${new Date().toLocaleTimeString()}`;
+};
+
+/* ---------- Controls ---------- */
+const windowSel = document.getElementById('window');
+const autoscale = document.getElementById('autoscale');
+const ymaxInput = document.getElementById('ymax');
+document.getElementById('pause').onclick = () => paused = !paused;
+document.getElementById('clear').onclick = () => clearAll();
+autoscale.onchange = () => { ymaxInput.disabled = autoscale.checked; applyYRange(); };
+windowSel.onchange = () => applyWindow();
+ymaxInput.onchange = () => applyYRange();
+autoscale.dispatchEvent(new Event('change'));
+
+/* ---------- Plotly setup ---------- */
+const chartEl = document.getElementById('chart');
+// Estimate incoming sample rate to size maxpoints. If unknown, 200Hz is a safe upper bound.
+let targetHz = 200; // adjust if you know your publisher rate
+
+const layout = {
+  margin: {l: 50, r: 10, t: 10, b: 30},
+  xaxis: { type: 'date', title: 'time →', tickformat: '%H:%M:%S', rangemode: 'tozero' },
+  yaxis: { title: 'Torque [N·m]', automargin: true, autorange: true },
+  showlegend: false,
+};
+
+Plotly.newPlot(chartEl, [], layout, {displayModeBar: false, responsive: true});
+
+function colorForSlave(slave) {
+  const h = (slave * 67) % 360;
+  return `hsl(${h},70%,45%)`;
+}
+
+function addTrace(slave) {
+  const trace = {
+    x: [], y: [],
+    mode: 'lines', type: 'scatter',
+    name: `S${slave}`,
+    line: { width: 2, color: colorForSlave(slave) },
+  };
+  Plotly.addTraces(chartEl, trace).then(() => {
+    const idx = chartEl.data.length - 1;
+    traces.set(slave, idx);
+    renderLegend();
+  });
+}
+
+function clearAll() {
+  latest.clear();
+  traces.clear();
+  Plotly.react(chartEl, [], layout);
+  renderTable();
+  renderLegend();
+}
+
+function applyYRange() {
+  if (autoscale.checked) {
+    Plotly.relayout(chartEl, {'yaxis.autorange': true});
+  } else {
+    const ymax = parseFloat(ymaxInput.value) || 5.0;
+    Plotly.relayout(chartEl, {'yaxis.autorange': false, 'yaxis.range': [-ymax, ymax]});
+  }
+}
+
+function applyWindow() {
+  // Plotly keeps a fixed number of points per trace; set via maxpoints during extendTraces.
+  // Nothing to do here other than affect future ExtendTraces calls and optionally prune.
+}
+
+/* ---------- Table & Legend ---------- */
+function renderTable() {
+  const rows = [...latest.values()].sort((a,b)=>a.slave-b.slave);
+  tbody.innerHTML = '';
+  for (const s of rows) {
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      `<td>S${s.slave}</td>`+
+      `<td>${Number(s.torque_Nm).toFixed(3)}</td>`+
+      `<td>${Number(s.ratio_percent).toFixed(1)}</td>`+
+      `<td>${s.seq}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+function renderLegend() {
+  const legend = document.getElementById('legend');
+  legend.innerHTML = '';
+  // match order of traces
+  chartEl.data.forEach((tr, i) => {
+    const div = document.createElement('div');
+    div.className = 'badge';
+    div.innerHTML = `<span class="dot" style="background:${tr.line.color}"></span> ${tr.name}`;
+    legend.appendChild(div);
+  });
+}
+
+// initial y-range apply
+applyYRange();
+</script>
+</body>
+</html>
