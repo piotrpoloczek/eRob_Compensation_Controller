@@ -40,6 +40,13 @@
 #define NSEC_PER_SEC 1000000000   // Number of nanoseconds in one second
 #define EC_TIMEOUTMON 5000        // Timeout for monitoring in microseconds
 
+
+/* Top of file (once) */
+static FILE *g_csv = NULL;
+static int   g_csv_decim = 0;
+
+
+
 // Function to synchronize time with the EtherCAT distributed clock
 void ec_sync(int64 reftime, int64 cycletime, int64 *offsettime);
 // Function to add nanoseconds to a timespec structure
@@ -197,61 +204,84 @@ OSAL_THREAD_FUNC_RT ecat_thread(void *ptr)
             // receive process data
             wkc = ec_receive_processdata(EC_TIMEOUTRET);
 
-            if (wkc >= expectedWKC) 
+
+
+            if (wkc >= expectedWKC)
             {
+                /* choose timestamp source once per cycle */
+                double t_sec;
+                if (ec_slave[0].hasdc) {
+                    t_sec = (double)ec_DCtime * 1e-9;     // DC time in seconds
+                } else {
+                    struct timespec now;
+                    clock_gettime(CLOCK_MONOTONIC, &now);
+                    t_sec = (double)now.tv_sec + (double)now.tv_nsec * 1e-9;
+                }
+
                 for (int slave = 1; slave <= ec_slavecount; slave++)
                 {
+                    /* copy this slave's inputs */
                     memcpy(&txpdo, ec_slave[slave].inputs, sizeof(txpdo_t));
-                    // check slave state
-                    if (ec_slave[slave].state != EC_STATE_OPERATIONAL)
-                    {
-                        ECAT_LOG("Warning: Slave %d not in OPERATIONAL state (State: 0x%02x)\n",  slave, ec_slave[slave].state);
+
+                    /* keep slave in OP */
+                    if (ec_slave[slave].state != EC_STATE_OPERATIONAL) {
+                        ECAT_LOG("Warning: Slave %d not in OPERATIONAL state (0x%02x)\n",
+                                slave, ec_slave[slave].state);
                         ec_slave[slave].state = EC_STATE_OPERATIONAL;
                         ec_writestate(slave);
                     }
-                }
 
-                // state machine control
-                // set motor control parameters must be placed here to run
+                    /* read torque every cycle */
+                    const double torque_Nm     = txpdo.torque_mN_m / 1000.0;   // mN·m → N·m
+                    const double ratio_percent = txpdo.torque_ratio_pm / 10.0; // 0.1% → %
+
+                    /* (optional) downsample console prints */
+                    if ((g_csv_decim % 10) == 0) {
+                        ECAT_LOG("[ECAT] Slave %d: Torque = %.3f N·m (raw %d mN·m), Ratio = %.1f%%\n",
+                                slave, torque_Nm, txpdo.torque_mN_m, ratio_percent);
+                    }
+
+                    /* open CSV once and write header */
+                    if (!g_csv) {
+                        g_csv = fopen("torque_log.csv", "w");
+                        if (g_csv) {
+                            fprintf(g_csv, "t_sec,slave,torque_Nm,ratio_percent\n");
+                            fflush(g_csv);
+                        } else {
+                            ECAT_LOG("ERROR: cannot open torque_log.csv for writing\n");
+                        }
+                    }
+
+                    /* write CSV (downsample if desired) */
+                    if (g_csv && ((g_csv_decim % 10) == 0)) {  // every 10th sample
+                        fprintf(g_csv, "%.6f,%d,%.6f,%.1f\n", t_sec, slave, torque_Nm, ratio_percent);
+                        fflush(g_csv);  // keep for live plotting; remove for max performance
+                    }
+                }
+                g_csv_decim++;
+                
+                /* ---- your state machine and outputs stay unchanged ---- */
                 *h_rx = MOTOR_CTRL_get_cmd();
-                if (step < 8000) 
-                {
-                    step++;
-                }
-                if (step <= 2000) 
-                {
-                    h_rx->controlword = 0x0080;
-                    h_rx->target_torque = 0;
-                } 
-                else if (step <= 2600) 
-                {
-                    h_rx->controlword = 0x0006;
-                    h_rx->target_torque = 0;
-                } 
-                else if (step <= 3000) 
-                {
-                    h_rx->controlword = 0x0007;
-                    h_rx->target_torque = 0;
-                } 
-                else if (step <= 3500)
-                {
-                    h_rx->controlword = 0x000F;
-                    h_rx->target_torque = 0;
-                } 
-                else 
-                {
+                if (step < 8000) step++;
+                if (step <= 2000) {
+                    h_rx->controlword = 0x0080; h_rx->target_torque = 0;
+                } else if (step <= 2600) {
+                    h_rx->controlword = 0x0006; h_rx->target_torque = 0;
+                } else if (step <= 3000) {
+                    h_rx->controlword = 0x0007; h_rx->target_torque = 0;
+                } else if (step <= 3500) {
+                    h_rx->controlword = 0x000F; h_rx->target_torque = 0;
+                } else {
                     h_rx->controlword = 0x000F;
                 }
 
-                // send data to slave
-                for (int slave = 1; slave <= ec_slavecount; slave++)
-                {
+                for (int slave = 1; slave <= ec_slavecount; slave++) {
                     memcpy(ec_slave[slave].outputs, &rxpdo, sizeof(rxpdo_t));
                 }
 
-                // read motor feedback parameters
                 MOTOR_CTRL_set_fbk_raw(*h_tx);
-            } 
+            }
+
 
             // clock synchronization
             if (ec_slave[0].hasdc) 
@@ -606,14 +636,26 @@ int erob_map_txpod(void)
         map_object = 0x60770010;
         retval += ec_SDOwrite(i, 0x1A00, 0x04, FALSE, sizeof(map_object), &map_object, EC_TIMEOUTSAFE);
 
+        // After Actual Torque (0x6077:0, 16 bits)
+        map_object = 0x3B690020;  // 0x3B69:0 Torque sensor value, DINT, 32 bits (mN·m)
+        retval += ec_SDOwrite(i, 0x1A00, 0x05, FALSE, sizeof(map_object), &map_object, EC_TIMEOUTSAFE);
+
+        map_object = 0x3B6A0010;  // 0x3B6A:0 Torque sensor ratio, INT, 16 bits (0.1 %)
+        retval += ec_SDOwrite(i, 0x1A00, 0x06, FALSE, sizeof(map_object), &map_object, EC_TIMEOUTSAFE);
+
+
         // // 电流基值 额定电流mA (0x6075:0, uint16_t) 对应上位机安全电源界面：持续电流。电机额定电流，它取自电机基本参数。
         // 读取不到，有空再分析，先直接设置
         // map_object = 0x60750010;
         // retval += ec_SDOwrite(i, 0x1A00, 0x05, FALSE, sizeof(map_object), &map_object, EC_TIMEOUTSAFE);
 
         // Set the number of mapped objects (5 objects)
-        uint8 map_count = 4;
+        // Update mapped count (we now have 6 entries)
+        uint8 map_count = 6;       // or 7 if you also mapped 0x6076
         retval += ec_SDOwrite(i, 0x1A00, 0x00, FALSE, sizeof(map_count), &map_count, EC_TIMEOUTSAFE);
+
+        // uint8 map_count = 4;
+        // retval += ec_SDOwrite(i, 0x1A00, 0x00, FALSE, sizeof(map_count), &map_count, EC_TIMEOUTSAFE);
 
         // Configure TXPDO assignment
         // First, clear the assignment
