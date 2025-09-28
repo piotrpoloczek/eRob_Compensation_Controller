@@ -1,3 +1,7 @@
 /build/**
 
 build
+
+torque-gateway/node_modules
+node_modules
+./torque-gateway/node_modules
