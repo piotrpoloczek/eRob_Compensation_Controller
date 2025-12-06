@@ -72,6 +72,163 @@ int erob_test(void);
 int kbhit(void);
 void key_control(void);
 
+
+//////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////
+
+// ---------------- GYM MODE SETTINGS ----------------
+
+enum GymMode {
+    GYM_OFF = 0,
+    GYM_ZERO = 1,
+    GYM_RESIST = 2
+};
+
+static int   g_gym_mode = GYM_OFF;
+
+static float g_gym_const_Nm   = 0.2f;
+static float g_gym_visc_Nm_s  = 0.005f;
+static float g_gym_max_Nm     = 2.0f;
+
+// torque sensor tare
+static int32_t g_torque_zero_mNm = 0;
+static int     g_tare_done = 0;
+
+
+// ---- Position-aware torque baseline ----
+static const int   GYM_BINS = 181;          // -90..+90 deg inclusive (1 deg bins)
+static int32_t     g_zero_tbl_mNm[GYM_BINS];
+static uint8_t     g_zero_valid[GYM_BINS];
+
+static inline int clampi(int v, int lo, int hi) {
+    return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+
+static inline int angle_to_bin(float angle_deg)
+{
+    int idx = (int)lroundf(angle_deg + 90.0f);
+    return clampi(idx, 0, GYM_BINS - 1);
+}
+
+
+//////////////////////////////////
+
+// -------- Startup SDO read helpers --------
+static bool read_sdo_i32(uint16 slave, uint16 index, uint8 sub, int32_t &out)
+{
+    int size = sizeof(out);
+    out = 0;
+    int wkc = ec_SDOread(slave, index, sub, FALSE, &size, &out, EC_TIMEOUTRXM);
+    return (wkc > 0 && size == (int)sizeof(out));
+}
+
+static bool read_sdo_i16(uint16 slave, uint16 index, uint8 sub, int16_t &out)
+{
+    int size = sizeof(out);
+    out = 0;
+    int wkc = ec_SDOread(slave, index, sub, FALSE, &size, &out, EC_TIMEOUTRXM);
+    return (wkc > 0 && size == (int)sizeof(out));
+}
+
+static void print_torque_sensor_sdo(uint16 slave)
+{
+    int32_t torque_raw = 0;
+    int16_t ratio_raw  = 0;
+
+    if (read_sdo_i32(slave, 0x3B69, 0x00, torque_raw)) {
+        printf("[BOOT] Slave %u SDO 0x3B69:00 Torque sensor raw = %d\n",
+               slave, torque_raw);
+    } else {
+        printf("[BOOT] Slave %u FAILED SDO 0x3B69:00\n", slave);
+    }
+
+    if (read_sdo_i16(slave, 0x3B6A, 0x00, ratio_raw)) {
+        printf("[BOOT] Slave %u SDO 0x3B6A:00 Torque ratio raw = %d (0.1%% units)\n",
+               slave, ratio_raw);
+    }
+}
+
+static float clampf(float x, float lo, float hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+
+static void gym_tare_update(int32_t torque_mNm_raw)
+{
+    const int N = 500;  // ~500 ms @ 1000 Hz
+    static int64_t acc = 0;
+    static int cnt = 0;
+
+    if (g_tare_done) return;
+
+    acc += torque_mNm_raw;
+    cnt++;
+
+    if (cnt >= N) {
+        g_torque_zero_mNm = (int32_t)(acc / cnt);
+        g_tare_done = 1;
+        acc = 0;
+        cnt = 0;
+
+        ECAT_LOG("[GYM] Torque tare set to %d mN·m (%.3f N·m)\n",
+                 g_torque_zero_mNm, g_torque_zero_mNm / 1000.0);
+    }
+}
+
+static inline double torque_comp_Nm(int32_t torque_mNm_raw)
+{
+    return (double)(torque_mNm_raw - g_torque_zero_mNm) / 1000.0;
+}
+
+
+static void gym_zero_update_when_still(float angle_deg,
+                                       float vel_dps,
+                                       int32_t torque_raw_mNm)
+{
+    // "still" conditions
+    const float vel_dead = 0.8f;      // deg/s
+    if (fabsf(vel_dps) > vel_dead) {
+        return;
+    }
+
+    int b = angle_to_bin(angle_deg);
+
+    // First time → take immediately
+    if (!g_zero_valid[b]) {
+        g_zero_tbl_mNm[b] = torque_raw_mNm;
+        g_zero_valid[b] = 1;
+        return;
+    }
+
+    // Slow IIR update (very gentle)
+    // This lets baseline adapt to drift and post-move settling
+    const float alpha = 0.01f; // 1% per update @ 1000 Hz → stable but slowly adapting
+    float z = (float)g_zero_tbl_mNm[b];
+    z = z + alpha * ((float)torque_raw_mNm - z);
+    g_zero_tbl_mNm[b] = (int32_t)lroundf(z);
+}
+
+
+static inline int32_t gym_zero_get(float angle_deg)
+{
+    int b = angle_to_bin(angle_deg);
+    if (g_zero_valid[b]) {
+        return g_zero_tbl_mNm[b];
+    }
+
+    // If not learned yet, fall back to 0
+    // (You can also fall back to nearest valid bin later)
+    return 0;
+}
+
+
+//////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////
+
 // Global variables for EtherCAT communication
 char IOmap[4096]; // I/O mapping for EtherCAT
 int expectedWKC; // Expected Work Counter
@@ -88,6 +245,11 @@ int64 toff, gl_delta; // Time offset and global delta for synchronization
 // Function prototypes for EtherCAT thread functions
 OSAL_THREAD_FUNC ecat_check(void *ptr); // Function to check the state of EtherCAT slaves
 OSAL_THREAD_FUNC ecat_thread(void *ptr); // Real-time EtherCAT thread function
+
+static uint64_t samp_count = 0;
+static double t0 = 0.0;
+static int rate_init = 0;
+
 
 // Thread handles for the EtherCAT threads
 OSAL_THREAD_HANDLE thread1; // Handle for the EtherCAT check thread
@@ -179,139 +341,219 @@ here requires real-time performance, no long-running logic is allowed
  */
 OSAL_THREAD_FUNC_RT ecat_thread(void *ptr)
 {
-    struct timespec ts, tleft; // Variables for time management
-    int ht; // Variable for high-resolution time
-    int64 cycletime; // Variable to hold the cycle time
-    struct timeval tp; // Variable for time value
+    struct timespec ts, tleft;
+    int ht;
+    int64 cycletime;
     rxpdo_t *h_rx = &rxpdo;
     txpdo_t *h_tx = &txpdo;
 
-    // Get the current time in monotonic clock
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    ht = (ts.tv_nsec / 1000000) + 1; /* Round to nearest ms */
-    ts.tv_nsec = ht * 1000000; // Set nanoseconds to the rounded value
-    if (ts.tv_nsec >= NSEC_PER_SEC) 
-    { // If nanoseconds exceed 1 second
-        ts.tv_sec++; // Increment seconds
-        ts.tv_nsec -= NSEC_PER_SEC; // Adjust nanoseconds
+    ht = (ts.tv_nsec / 1000000) + 1;
+    ts.tv_nsec = ht * 1000000;
+    if (ts.tv_nsec >= NSEC_PER_SEC) {
+        ts.tv_sec++;
+        ts.tv_nsec -= NSEC_PER_SEC;
     }
-    cycletime = *(int *)ptr * 1000; /* Convert cycle time from ms to ns */
-    float dt = cycletime * 1e-9; // 控制周期 s
+
+    cycletime = *(int *)ptr * 1000;   // us -> ns
+    const float dt = (float)cycletime * 1e-9f;
     ECAT_LOG("cycletime:%.3fs\n", dt);
 
-    toff = 0; // Initialize time offset
-    dorun = 0; // Initialize run flag
-    ec_send_processdata(); // Send initial process data
+    toff = 0;
+    dorun = 0;
+    rate_init = 0;
+    samp_count = 0;
 
-    while (exit_app == 0x00) 
-    {   // Infinite loop for real-time processing
-        /* Calculate next cycle start */
-        add_timespec(&ts, cycletime + toff); // Add cycle time to the current time
-        /* Wait for the cycle start */
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, &tleft); // Sleep until the next cycle
+    ec_send_processdata();
 
-        if (start_ecatthread_thread) 
-        {   // Check if the EtherCAT thread should run
-            // receive process data
-            wkc = ec_receive_processdata(EC_TIMEOUTRET);
+    // Per-slave velocity smoothing (safe small fixed array)
+    // If you expect more than 16 slaves, raise this.
+    static float vel_dps_f[16] = {0};
 
+    while (exit_app == 0x00)
+    {
+        add_timespec(&ts, cycletime + toff);
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, &tleft);
 
+        if (!start_ecatthread_thread) {
+            continue;
+        }
 
-            if (wkc >= expectedWKC)
+        wkc = ec_receive_processdata(EC_TIMEOUTRET);
+
+        if (wkc >= expectedWKC)
+        {
+            // -----------------------------
+            // Time source (FIXED ORDER)
+            // -----------------------------
+            double t_sec = 0.0;
+            if (ec_slave[0].hasdc) {
+                t_sec = (double)ec_DCtime * 1e-9;
+            } else {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                t_sec = (double)now.tv_sec + (double)now.tv_nsec * 1e-9;
+            }
+
+            // -----------------------------
+            // Rate monitor (1 Hz print)
+            // -----------------------------
+            if (!rate_init) {
+                t0 = t_sec;
+                rate_init = 1;
+            }
+
+            samp_count++;
+            double elapsed = t_sec - t0;
+            if (elapsed >= 1.0) {
+                double hz = samp_count / elapsed;
+                ECAT_LOG("[RATE] Effective loop rate: %.1f Hz\n", hz);
+                samp_count = 0;
+                t0 = t_sec;
+            }
+
+            // Step advance once per cycle
+            if (step < 8000) {
+                step++;
+            }
+
+            // Iterate slaves
+            for (int slave = 1; slave <= ec_slavecount; slave++)
             {
-                /* choose timestamp source once per cycle */
-                double t_sec;
-                if (ec_slave[0].hasdc) {
-                    t_sec = (double)ec_DCtime * 1e-9;     // DC time in seconds
-                } else {
-                    struct timespec now;
-                    clock_gettime(CLOCK_MONOTONIC, &now);
-                    t_sec = (double)now.tv_sec + (double)now.tv_nsec * 1e-9;
-                }
+                // Copy this slave's inputs
+                memcpy(&txpdo, ec_slave[slave].inputs, sizeof(txpdo_t));
 
-                for (int slave = 1; slave <= ec_slavecount; slave++)
-                {
-                    /* copy this slave's inputs */
-                    memcpy(&txpdo, ec_slave[slave].inputs, sizeof(txpdo_t));
-
-                    
-
-                    /* keep slave in OP */
-                    if (ec_slave[slave].state != EC_STATE_OPERATIONAL) {
-                        ECAT_LOG("Warning: Slave %d not in OPERATIONAL state (0x%02x)\n",
-                                slave, ec_slave[slave].state);
-                        ec_slave[slave].state = EC_STATE_OPERATIONAL;
-                        ec_writestate(slave);
-                    }
-
-                    /* read torque every cycle */
-                    const double torque_Nm     = txpdo.torque_mN_m / 1000.0;   // mN·m → N·m
-                    const double ratio_percent = txpdo.torque_ratio_pm / 10.0; // 0.1% → %
-
-                    g_pub.send_sample((uint16_t)slave,
-                        (int32_t)txpdo.torque_mN_m,
-                        (int16_t)txpdo.torque_ratio_pm);
-
-                    /* (optional) downsample console prints */
-                    if ((g_csv_decim % 10) == 0) {
-                        ECAT_LOG("[ECAT] Slave %d: Torque = %.3f N·m (raw %d mN·m), Ratio = %.1f%%\n",
-                                slave, torque_Nm, txpdo.torque_mN_m, ratio_percent);
-                    }
-
-                    /* open CSV once and write header */
-                    if (!g_csv) {
-                        g_csv = fopen("torque_log.csv", "w");
-                        if (g_csv) {
-                            fprintf(g_csv, "t_sec,slave,torque_Nm,ratio_percent\n");
-                            fflush(g_csv);
-                        } else {
-                            ECAT_LOG("ERROR: cannot open torque_log.csv for writing\n");
-                        }
-                    }
-
-                    /* write CSV (downsample if desired) */
-                    if (g_csv && ((g_csv_decim % 10) == 0)) {  // every 10th sample
-                        fprintf(g_csv, "%.6f,%d,%.6f,%.1f\n", t_sec, slave, torque_Nm, ratio_percent);
-                        fflush(g_csv);  // keep for live plotting; remove for max performance
-                    }
-                }
-                g_csv_decim++;
-                
-                /* ---- your state machine and outputs stay unchanged ---- */
+                // Pull base command
                 *h_rx = MOTOR_CTRL_get_cmd();
-                if (step < 8000) step++;
+
+                const bool is_pt = (h_rx->mode_of_operation == 0x04);
+
+                if (is_pt && g_gym_mode != GYM_OFF) {
+                    // -------------------------
+                // GYM MODE (single block)
+                // -------------------------
+                if (g_gym_mode != GYM_OFF)
+                {
+                    // Update tare once torque values are valid
+                    gym_tare_update(txpdo.torque_mN_m);
+
+                    const double torque_Nm_comp = torque_comp_Nm(txpdo.torque_mN_m);
+                    const double ratio_percent  = txpdo.torque_ratio_pm / 10.0;
+
+                    // Slow console prints (~2 Hz)
+                    if ((g_csv_decim % 500) == 0) {
+                        ECAT_LOG("[ECAT] Slave %d: Torque(comp) = %.3f N·m (raw %d mN·m), Ratio = %.1f%%\n",
+                                 slave, torque_Nm_comp, txpdo.torque_mN_m, ratio_percent);
+                    }
+
+                    // -------------
+                    // GYM_ZERO
+                    // -------------
+                    if (g_gym_mode == GYM_ZERO) {
+                        h_rx->target_torque = 0;
+                    }
+
+                    else if (g_gym_mode == GYM_RESIST) {
+
+                        // 1) Read raw velocity (as you already do)
+                        const int32_t vel_cnt = txpdo.actual_velocity;
+                        const float vel_dps_raw = vel_cnt * Cnt_to_deg;
+
+                        // 2) Small smoothing for velocity
+                        static float vel_dps_f = 0.0f;
+                        const float alpha_v = 0.10f;
+                        vel_dps_f = vel_dps_f + alpha_v * (vel_dps_raw - vel_dps_f);
+
+                        // 3) User torque (already compensated around tare in your logic)
+                        // If torque_comp_Nm() already subtracts tare, great.
+                        // If not, use: torque_user = (txpdo.torque_mN_m - g_tare_mNm) * 1e-3;
+                        float torque_user = (float)torque_comp_Nm(txpdo.torque_mN_m);
+
+                        // 4) Filter torque a bit (faster than velocity filter)
+                        static float torque_f = 0.0f;
+                        const float alpha_t = 0.20f;
+                        torque_f = torque_f + alpha_t * (torque_user - torque_f);
+
+                        // 5) Intent thresholds
+                        const float T_intent_Nm = 0.6f;   // start feeling you
+                        const float T_release_Nm = 0.3f;  // hysteresis to avoid chatter
+
+                        static bool intent = false;
+                        if (!intent && fabsf(torque_f) > T_intent_Nm) intent = true;
+                        if ( intent && fabsf(torque_f) < T_release_Nm) intent = false;
+
+                        // 6) Build resist torque
+                        float T_gym = 0.0f;
+
+                        if (intent) {
+                            const float sgn = (torque_f > 0) ? 1.0f : -1.0f;
+
+                            // "Coulomb-like" term triggered by torque intent
+                            T_gym += -(g_gym_const_Nm * sgn);
+
+                            // Viscous term still tied to actual motion
+                            T_gym += -(g_gym_visc_Nm_s * vel_dps_f);
+                        }
+
+                        T_gym = clampf(T_gym, -g_gym_max_Nm, +g_gym_max_Nm);
+
+                        const int16_t T_cmd_mNm = (int16_t)lroundf(T_gym * 1000.0f);
+                        h_rx->target_torque = T_cmd_mNm;
+                    }
+
+
+                    // -------------
+                    // GYM_RESIST
+                    // -------------
+                    
+                }
+                }
+
+
+                
+
+                // -------------------------
+                // Startup state machine
+                // (overrides gym torque)
+                // -------------------------
                 if (step <= 2000) {
-                    h_rx->controlword = 0x0080; h_rx->target_torque = 0;
+                    h_rx->controlword = 0x0080;
+                    h_rx->target_torque = 0;
                 } else if (step <= 2600) {
-                    h_rx->controlword = 0x0006; h_rx->target_torque = 0;
+                    h_rx->controlword = 0x0006;
+                    h_rx->target_torque = 0;
                 } else if (step <= 3000) {
-                    h_rx->controlword = 0x0007; h_rx->target_torque = 0;
+                    h_rx->controlword = 0x0007;
+                    h_rx->target_torque = 0;
                 } else if (step <= 3500) {
-                    h_rx->controlword = 0x000F; h_rx->target_torque = 0;
+                    h_rx->controlword = 0x000F;
+                    h_rx->target_torque = 0;
                 } else {
                     h_rx->controlword = 0x000F;
                 }
 
-                for (int slave = 1; slave <= ec_slavecount; slave++) {
-                    memcpy(ec_slave[slave].outputs, &rxpdo, sizeof(rxpdo_t));
-                }
-
-                MOTOR_CTRL_set_fbk_raw(*h_tx);
+                // Copy outputs to this slave
+                memcpy(ec_slave[slave].outputs, &rxpdo, sizeof(rxpdo_t));
             }
 
+            // Advance decimator once per cycle
+            g_csv_decim++;
 
-            // clock synchronization
-            if (ec_slave[0].hasdc) 
-            {
-                ec_sync(ec_DCtime, cycletime, &toff);
-            }
-
-                // send process data
-            ec_send_processdata();
+            // Feedback uses last copied txpdo (OK for single slave)
+            MOTOR_CTRL_set_fbk_raw(*h_tx);
         }
+
+        // DC sync
+        if (ec_slave[0].hasdc) {
+            ec_sync(ec_DCtime, cycletime, &toff);
+        }
+
+        ec_send_processdata();
     }
+
     MOTOR_CTRL_exit();
 }
+
 
 
 /* 
@@ -449,7 +691,8 @@ int erob_step_1(void)
     ECAT_LOG("__________STEP 1___________________\n");
 
     const char *env  = getenv("EC_IFACE");
-    const char *used = env;
+    const char *used = env ? env : "eth0";
+
 
     /* Initialize EtherCAT master on the chosen interface */
     if (ec_init(used) <= 0) {
@@ -463,6 +706,7 @@ int erob_step_1(void)
     ECAT_LOG("___________________________________________\n");
 
     // Search for EtherCAT slaves on the network
+    // Search for EtherCAT slaves on the network
     if (ec_config_init(FALSE) <= 0) {
         ECAT_LOG("Error: Cannot find EtherCAT slaves!\n");
         ECAT_LOG("___________________________________________\n");
@@ -471,8 +715,16 @@ int erob_step_1(void)
     }
 
     ECAT_LOG("%d slaves found and configured.\n", ec_slavecount);
+
+    // ---- BOOT SDO sanity read ----
+    for (int s = 1; s <= ec_slavecount; s++) {
+        print_torque_sensor_sdo(s);
+    }
+    // ------------------------------
+
     ECAT_LOG("___________________________________________\n");
     return 0;
+
 }
 
 // 2. Change to pre-operational state to configure the PDO registers
