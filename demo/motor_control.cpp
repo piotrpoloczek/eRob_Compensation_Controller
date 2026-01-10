@@ -3,11 +3,15 @@
  * @Date: 2025-08-06 15:58:55
  * @LastEditors: 抖音@翼之道男
  *
- * Corrected by ChatGPT:
- * - Fix torque boost direction with TS_SIGN
- * - Add bias snapshot on enable to prevent self-motion
- * - Add hysteresis deadband + slow bias trim
- * - Fix small syntax issues
+ * Corrected + integrated:
+ * - FIX extern vs static for p_file_log
+ * - FIX enum order
+ * - Use torque_assist.h as the boost engine
+ * - Keep TS_SIGN direction fix
+ * - Keep bias snapshot on enable to prevent self-motion
+ * - Safe mc_mode_name array + static_assert
+ * - Add robust torque sensor debug print
+ * - Add 2nd assist mode with friction comp ON
  */
 
 #include "motor_control.h"
@@ -29,12 +33,12 @@
 #include <cmath>
 #include <cstdint>
 
+#include "torque_assist.h"
+
 // ---------------------------------------------
 // External app control flag (likely in main)
 // ---------------------------------------------
 extern uint8_t exit_app;
-
-// #define MOTOR_EN_FRIC_IDEN // start friction identification
 
 // module parameters
 #define MOTOR_CURRENT_BASE       (5.4f)       // motor current base = rated current A
@@ -45,9 +49,27 @@ extern uint8_t exit_app;
 #define MOTOR_UNLIMITED_ACCEL    (1000.0F)    // rpm/s
 #define MOTOR_LIMITED_ACCEL      (10.0f)      // rpm/s
 
-// ---------------- TORQUE SENSOR BOOST ----------------
+// ======================================================
+// Torque sensor assist debug options
+// ======================================================
+#ifndef TS_DEBUG_RATIO_CROSSCHECK
+#define TS_DEBUG_RATIO_CROSSCHECK 0
+#endif
 
-// Enable flag
+#ifndef TS_RATIO_FIELD
+#define TS_RATIO_FIELD torque_ratio_permil
+#endif
+
+#ifndef TS_RATED_FIELD
+#define TS_RATED_FIELD rated_torque_mN_m
+#endif
+
+// ---------------- TORQUE SENSOR ASSIST ----------------
+
+static float g_touch_sign = 0.0f;
+
+
+// Enable flag (manual toggle with 't')
 static uint8_t g_en_torque_boost = 0x00;
 
 // Tare state
@@ -55,30 +77,38 @@ static int32_t g_ts_zero_mN_m = 0;
 static uint8_t g_ts_tare_done = 0;
 
 // Direction fix
-// If "touch left -> moves right", you need -1.
-// If it becomes wrong again, flip to +1.
 static constexpr float TS_SIGN = -1.0f;
 
-// Assist tuning
-static float g_ts_stiction_mA        = 30.0f;   // kick to overcome static friction
-static float g_ts_gain_mA_per_Nm     = 100.0f;
-static float g_ts_max_mA             = 300.0f;
-
-// Hysteresis deadband (prevents oscillation / self-creep)
-static float g_ts_deadband_on_Nm  = 1.00f;
-static float g_ts_deadband_off_Nm = 0.50f;
-
 // Bias removal for "zero effort feel"
-// This is separate from tare.
-// Tare removes sensor offset.
-// Bias removes static load at the current pose / support state.
 static float   g_ts_bias_Nm = 0.0f;
 static uint8_t g_ts_bias_valid = 0;
 
-// Internal state
-static uint8_t g_ts_active = 0;
+// Assist config/state
+static TorqueAssistConfig g_ts_cfg;
+static TorqueAssistState  g_ts_state;
 
-// Simple clamp
+//////////////
+
+// ------------------------------
+// TS touch-pulse test mode
+// ------------------------------
+
+// intent detection threshold (Nm)
+static float g_touch_on_Nm = 0.30f;     // tune 0.2~0.6
+
+// consider axis "still"
+static float g_touch_still_rpm = 0.6f;  // tune 0.3~1.0
+
+// pulse parameters
+static float g_touch_pulse_mA = 120.0f; // fixed assist current
+static float g_touch_pulse_s  = 2.0f;   // your requirement
+
+// internal countdown
+static float g_touch_left_s = 0.0f;
+
+/////////////
+
+// Simple clamp/sign local
 static inline float clampf_local(float x, float lo, float hi)
 {
     return (x < lo) ? lo : (x > hi) ? hi : x;
@@ -129,25 +159,45 @@ static inline float torque_sensor_comp_Nm(int32_t torque_mN_m_raw)
 // ------------------------------------------------------
 typedef enum
 {
-  MC_MODE_OFF = 0X00,            // idle
-  MC_MODE_COMP_FRIC_PT,         // current loop mode after friction compensation
-  MC_MODE_COMP_GRAVITY_PT,      // current loop mode after gravity compensation
-  MC_MODE_COMP_PT,              // current loop mode after gravity and friction compensation
-  MC_MODE_COMP_PV,              // speed loop mode after gravity and friction compensation
-  MC_MODE_FRIC_IDEN,            // friction identification
-  MC_MODE_COMP_PV_IDEN_SIN,     // speed loop identification sine
-  MC_MODE_COMP_PV_IDEN_SQUARE,  // speed loop identification square
-  MC_MODE_COMP_PV_IDEN_SIN_2,   // sine with accel limit
-  MC_MODE_COMP_PV_IDEN_SQUARE_2,// square with accel limit
+  MC_MODE_OFF = 0X00,
+  MC_MODE_COMP_FRIC_PT,
+  MC_MODE_COMP_GRAVITY_PT,
+  MC_MODE_COMP_PT,
+  MC_MODE_COMP_PV,
+  MC_MODE_FRIC_IDEN,
+  MC_MODE_COMP_PV_IDEN_SIN,
+  MC_MODE_COMP_PV_IDEN_SQUARE,
+  MC_MODE_COMP_PV_IDEN_SIN_2,
+  MC_MODE_COMP_PV_IDEN_SQUARE_2,
+
+  // Assist modes (PT-based)
+  MC_MODE_TS_ASSIST,        // pure assist
+  MC_MODE_TS_ASSIST_FRIC,   // assist + friction comp ON (recommended)
+  // --- NEW: simple intent test ---
+  MC_MODE_TS_TOUCH_PULSE,
+
   MC_MODE_NUM,
 } MOTOR_CTRL_mode_e;
 
-char mc_mode_name[MC_MODE_NUM][45] = {
-    "MC_MODE_OFF","MC_MODE_COMP_FRIC_PT",
-    "MC_MODE_COMP_GRAVITY_PT", "MC_MODE_COMP_PT","MC_MODE_COMP_PV",
-    "MC_MODE_FRIC_IDEN","MC_MODE_COMP_PV_IDEN_SIN","MC_MODE_COMP_PV_IDEN_SQUARE",
-    "MC_MODE_COMP_PV_IDEN_SIN_2","MC_MODE_COMP_PV_IDEN_SQUARE_2"
+static const char* mc_mode_name[] = {
+    "MC_MODE_OFF",
+    "MC_MODE_COMP_FRIC_PT",
+    "MC_MODE_COMP_GRAVITY_PT",
+    "MC_MODE_COMP_PT",
+    "MC_MODE_COMP_PV",
+    "MC_MODE_FRIC_IDEN",
+    "MC_MODE_COMP_PV_IDEN_SIN",
+    "MC_MODE_COMP_PV_IDEN_SQUARE",
+    "MC_MODE_COMP_PV_IDEN_SIN_2",
+    "MC_MODE_COMP_PV_IDEN_SQUARE_2",
+    "MC_MODE_TS_ASSIST",
+    "MC_MODE_TS_ASSIST_FRIC",
+    "MC_MODE_TS_TOUCH_PULSE"
 };
+
+static_assert(sizeof(mc_mode_name)/sizeof(mc_mode_name[0]) == MC_MODE_NUM,
+              "mc_mode_name size must match MC_MODE_NUM");
+
 
 // motor control structure
 typedef struct
@@ -204,19 +254,22 @@ typedef struct
     TF_2RD_t tf_spd_c;
     SLOP_t   slop_spd;
 
-    // --- torque sensor boost ---
+    // --- torque sensor assist ---
     uint8_t en_torque_boost;
-    float torque_sens_Nm;  // signed + tared
-    float torque_user_Nm;  // signed + tared + bias-removed
-    float current_boost;   // mA
+    float torque_sens_Nm;
+    float torque_user_Nm;
+    float current_boost;
 
 } MOTOR_CTRL_t, *MOTOR_CTRL_h;
 
-void MOTOR_CTRL_key(void);
+static void MOTOR_CTRL_key(void);
 
+// globals
 MOTOR_CTRL_t g_motor_ctrl;
+
+// IMPORTANT: not static (matches extern in header)
 FILE *p_file_log = NULL;
-FILE *p_data = NULL;
+static FILE *p_data = NULL;
 
 
 // ------------------------------------------------------
@@ -244,10 +297,12 @@ void MOTOR_CTRL_init(void)
     h->torque_user_Nm  = 0.0f;
     h->current_boost   = 0.0f;
 
-    // control mode
+    h->en_fric_comp = 0x00;
+    h->en_gravity_comp = 0x00;
+    h->en_fric_iden = 0x00;
+
     h->mode = MC_MODE_OFF;
 
-    // motor control mode configuration
     h->cmd_raw.controlword = 0x000F;
     h->cmd_raw.torque_slope = 0x00;
     h->cmd_raw.max_torque = h->current_max / h->current_base;
@@ -257,7 +312,6 @@ void MOTOR_CTRL_init(void)
     h->cmd_raw.accelerate_up = 2000000;
     h->cmd_raw.accelerate_down = 2000000;
 
-    // speed loop model
     TF_2RD_discrete_init(&h->tf_spd_d,
                          0.0121667f, 0.0243333f, 0.0121667f,
                          1.0f, -1.7175803f, 0.7660727f);
@@ -283,13 +337,35 @@ void MOTOR_CTRL_init(void)
     clock_gettime(CLOCK_MONOTONIC, &h->time_now);
     h->time_pre = h->time_now;
 
-    // reset TS state
+    // ---------------- TS reset ----------------
     g_ts_zero_mN_m = 0;
     g_ts_tare_done = 0;
+
     g_ts_bias_Nm = 0.0f;
     g_ts_bias_valid = 0;
-    g_ts_active = 0;
+
     g_en_torque_boost = 0x00;
+
+    g_ts_state.active = false;
+    g_ts_state.ts_user_filt = 0.0f;
+
+    // Touch-pulse reset
+    g_touch_left_s = 0.0f;
+
+
+    // ---------------- Assist tuning ----------------
+    g_ts_cfg.on_Nm  = 1.00f;
+    g_ts_cfg.off_Nm = 0.50f;
+
+    g_ts_cfg.stiction_mA = 60.0f;
+    g_ts_cfg.gain_mA_per_Nm = 180.0f;
+    g_ts_cfg.max_mA = 600.0f;
+
+    g_ts_cfg.filt_alpha = 0.15f;
+
+    h->tick = 0;
+    h->delay = 0.0f;
+    h->time = 0.0f;
 }
 
 
@@ -433,6 +509,65 @@ void MOTOR_CTRL_step(float dt)
             break;
         }
 
+        // ------------------------------
+        // Torque-only assist mode (pure)
+        // ------------------------------
+        case MC_MODE_TS_ASSIST:
+        {
+            h->cmd_raw.mode_of_operation = 0x04; // PT
+
+            h->en_fric_iden = 0x00;
+            h->en_fric_comp = 0x00;
+            h->en_gravity_comp = 0x00;
+
+            h->speed_ref = 0.0f;
+            h->current_ref = 0.0f;
+            h->current_offset_user = 0.0f;
+
+            h->accel_limit_rpm = MOTOR_UNLIMITED_ACCEL;
+            break;
+        }
+
+        // ------------------------------------------------
+        // Assist + friction comp (better feel both ways)
+        // ------------------------------------------------
+        case MC_MODE_TS_ASSIST_FRIC:
+        {
+            h->cmd_raw.mode_of_operation = 0x04; // PT
+
+            h->en_fric_iden = 0x00;
+            h->en_fric_comp = 0x01;
+            h->en_gravity_comp = 0x00;
+
+            h->speed_ref = 0.0f;
+            h->current_ref = 0.0f;
+            h->current_offset_user = 0.0f;
+
+            h->accel_limit_rpm = MOTOR_UNLIMITED_ACCEL;
+            break;
+        }
+
+                // -----------------------------------------
+        // Simple intent -> fixed 2s boost test
+        // -----------------------------------------
+        case MC_MODE_TS_TOUCH_PULSE:
+        {
+            h->cmd_raw.mode_of_operation = 0x04; // PT
+
+            h->en_fric_iden = 0x00;
+            h->en_fric_comp = 0x00;
+            h->en_gravity_comp = 0x00;
+
+            h->speed_ref = 0.0f;
+            h->current_ref = 0.0f;
+            h->current_offset_user = 0.0f;
+            h->current_offset = 0.0f;
+
+            h->accel_limit_rpm = MOTOR_UNLIMITED_ACCEL;
+            break;
+        }
+
+
         default:
             break;
     }
@@ -463,71 +598,112 @@ void MOTOR_CTRL_step(float dt)
     lpf_step(&h->lpf_current, h->current_fbk, h->dt);
 
     // ---------------- Torque sensor tare ----------------
-    // auto tare when nearly still
     torque_sensor_tare_update(h->speed_fbk_rpm, h_tx->torque_mN_m);
 
     // signed + tared
-    h->torque_sens_Nm = TS_SIGN * torque_sensor_comp_Nm(h_tx->torque_mN_m);
+    const float ts_comp_Nm = torque_sensor_comp_Nm(h_tx->torque_mN_m);
+    h->torque_sens_Nm = TS_SIGN * ts_comp_Nm;
 
-    // ---------------- Torque boost compute ----------------
+    // ---------------- Assist enable logic ----------------
+    
+    bool in_assist_mode =
+        (h->mode == MC_MODE_TS_ASSIST) ||
+        (h->mode == MC_MODE_TS_ASSIST_FRIC) ||
+        (h->mode == MC_MODE_TS_TOUCH_PULSE);
+
+    bool assist_enabled = (g_en_torque_boost != 0) || in_assist_mode;
+
+
+    h->en_torque_boost = assist_enabled ? 1 : 0;
+
+    // ---------------- Torque assist compute ----------------
+    // ---------------- Torque assist compute ----------------
     float boost = 0.0f;
 
-    if (!g_en_torque_boost || !g_ts_tare_done) {
-        g_ts_active = 0;
+    const bool in_touch_pulse_mode = (h->mode == MC_MODE_TS_TOUCH_PULSE);
+
+    if (!assist_enabled || !g_ts_tare_done) {
         boost = 0.0f;
+        g_ts_state.active = false;
+        g_ts_state.ts_user_filt = 0.0f;
+        h->torque_user_Nm = 0.0f;
+
+        g_touch_left_s = 0.0f;
+
     } else {
 
-        // If bias not valid yet, capture a snapshot
-        // This is the key fix for "enable t -> motor moves by itself".
+        // Capture bias snapshot on first enable
         if (!g_ts_bias_valid) {
             g_ts_bias_Nm = h->torque_sens_Nm;
             g_ts_bias_valid = 1;
-            g_ts_active = 0;
+
+            g_ts_state.active = false;
+            g_ts_state.ts_user_filt = 0.0f;
+
+            g_touch_left_s = 0.0f;
         }
 
-        // torque user intent after bias removal
+        // user intent after bias removal
         h->torque_user_Nm = h->torque_sens_Nm - g_ts_bias_Nm;
 
-        float abs_user = std::fabs(h->torque_user_Nm);
-
-        // hysteresis deadband
-        if (!g_ts_active) {
-            if (abs_user >= g_ts_deadband_on_Nm) {
-                g_ts_active = 1;
-            }
-        } else {
-            if (abs_user <= g_ts_deadband_off_Nm) {
-                g_ts_active = 0;
-            }
-        }
-
-        // If inactive, slowly trim bias to follow drift
-        // only when near still
-        if (!g_ts_active && std::fabs(h->speed_fbk_rpm) < 0.3f) {
-            const float alpha = 0.002f; // slow
+        // When inactive and nearly still, slowly track drift
+        if (!g_ts_state.active && std::fabs(h->speed_fbk_rpm) < 0.3f) {
+            const float alpha = 0.002f;
             g_ts_bias_Nm = (1.0f - alpha) * g_ts_bias_Nm + alpha * h->torque_sens_Nm;
             h->torque_user_Nm = h->torque_sens_Nm - g_ts_bias_Nm;
         }
 
-        // compute boost if active
-        if (g_ts_active) {
-            boost = h->torque_user_Nm * g_ts_gain_mA_per_Nm;
-            boost += signf_local(h->torque_user_Nm) * g_ts_stiction_mA;
-            boost = clampf_local(boost, -g_ts_max_mA, +g_ts_max_mA);
+        // -----------------------------------------
+        // NEW: ultra-simple intent → 2s pulse mode
+        // -----------------------------------------
+        if (in_touch_pulse_mode) {
+
+            // countdown active pulse
+            if (g_touch_left_s > 0.0f) {
+                g_touch_left_s -= h->dt_2;
+                if (g_touch_left_s < 0.0f) g_touch_left_s = 0.0f;
+
+                g_touch_left_s = g_touch_pulse_s;
+                g_touch_sign = signf_local(h->torque_user_Nm);
+                boost = g_touch_sign * g_touch_pulse_mA;
+
+            } else {
+
+                // detect intent only when still
+                if (std::fabs(h->speed_fbk_rpm) < g_touch_still_rpm &&
+                    std::fabs(h->torque_user_Nm) > g_touch_on_Nm)
+                {
+                    g_touch_left_s = g_touch_pulse_s; // 2 seconds
+                    boost = g_touch_sign * g_touch_pulse_mA;
+
+                } else {
+                    boost = 0.0f;
+                }
+            }
+
+            // Do not use hysteresis assist state here
+            g_ts_state.active = false;
+            g_ts_state.ts_user_filt = 0.0f;
+
         } else {
-            boost = 0.0f;
+            // existing assist engine
+            boost = torque_assist_update(g_ts_state, g_ts_cfg, h->torque_user_Nm);
         }
     }
 
     h->current_boost = boost;
 
+    
+
     // ---------------- Accel limit write ----------------
     h->accel_limit = h->accel_limit_rpm * YZDN_MATH_K_RPM2RADPS;
     float accel_raw = h->accel_limit_rpm * YZDN_MATH_K_RPM2RADPS * MOTOR_K_RADPS2SIMPS;
-    if(accel_raw > 2000000.0f) accel_raw = 2000000.0f;
 
-    h_rx->accelerate_up = accel_raw;
-    h_rx->accelerate_down = accel_raw;
+    // slightly higher cap so assist doesn't feel "stuck"
+    if(accel_raw > 6000000.0f) accel_raw = 6000000.0f;
+
+    h_rx->accelerate_up = (uint32_t)accel_raw;
+    h_rx->accelerate_down = (uint32_t)accel_raw;
 
     // ---------------- Compensation ----------------
     h->current_fric = Friction_Identify_compensate_step(h->speed_fbk_rpm);
@@ -543,8 +719,8 @@ void MOTOR_CTRL_step(float dt)
     float offset_eff = offset_base;
 
     // Apply boost:
-    // - PT mode: add to target torque
-    // - PV mode: add to feedforward offset
+    // In PT mode, boost is most meaningful as extra target torque.
+    // In PV mode, many drives ignore target_torque -> boost may not "feel" effective.
     if (h->cmd_raw.mode_of_operation == 0x04) {
         ref_eff += h->current_boost;
     } else {
@@ -552,7 +728,7 @@ void MOTOR_CTRL_step(float dt)
     }
 
     // clamp
-    ref_eff    = clampf_local(ref_eff,   -h->current_max, +h->current_max);
+    ref_eff    = clampf_local(ref_eff,    -h->current_max, +h->current_max);
     offset_eff = clampf_local(offset_eff, -h->current_max, +h->current_max);
 
     // store for log
@@ -563,21 +739,43 @@ void MOTOR_CTRL_step(float dt)
     h_rx->torque_offset = offset_eff / h->current_base;
 
     // speed target
-    h_rx->speed_target = h->speed_ref * YZDN_MATH_K_RPM2RADPS * MOTOR_K_RADPS2SIMPS;
+    h_rx->speed_target =
+        h->speed_ref * YZDN_MATH_K_RPM2RADPS * MOTOR_K_RADPS2SIMPS;
 
-    // ---------------- Print ----------------
+    // ---------------- Debug print ----------------
     if (h->tick % 500 == 0)
     {
+        const float ts_user_dbg = (g_ts_bias_valid) ? h->torque_user_Nm : 0.0f;
+        const float ts_raw_Nm = (float)h_tx->torque_mN_m * 1e-3f;
+
         ECAT_LOG("mode:%d, spd_ref:%.1f, i_ref:%.1f, i_offset:%.1f, "
                  "angle:%.1f, spd:%.1f, i:%.1f, i_fric:%.1f, i_gravity:%.1f, "
-                 "ts:%.3fNm, ts_user:%.3fNm, i_boost:%.1f\n",
+                 "TS_raw:%d mNm(%.3fNm), TS_zero:%d mNm, TS_comp:%.3fNm, "
+                 "TS_signed:%.3fNm, bias:%.3fNm(%d), TS_user:%.3fNm, "
+                 "assist:%d(active=%d), i_boost:%.1f\n",
                  h->mode,
                  h->speed_ref, h->current_ref, h->current_offset,
                  h->angle_fbk_deg, h->speed_fbk_rpm, h->current_fbk,
                  h->current_fric, h->current_gravity,
+                 h_tx->torque_mN_m, ts_raw_Nm,
+                 g_ts_zero_mN_m, ts_comp_Nm,
                  h->torque_sens_Nm,
-                 (g_ts_bias_valid ? (h->torque_sens_Nm - g_ts_bias_Nm) : 0.0f),
+                 g_ts_bias_Nm, g_ts_bias_valid,
+                 ts_user_dbg,
+                 (int)assist_enabled, (int)g_ts_state.active,
                  h->current_boost);
+
+#if TS_DEBUG_RATIO_CROSSCHECK
+        float ts_ratio_est_mNm =
+            (float)(h_tx->TS_RATIO_FIELD) * (float)(h_tx->TS_RATED_FIELD) / 1000.0f;
+
+        ECAT_LOG("[TS RATIO CHECK] 3B69=%d mNm, ratio_est=%.1f mNm "
+                 "(ratio=%d, rated=%d)\n",
+                 h_tx->torque_mN_m,
+                 ts_ratio_est_mNm,
+                 (int)h_tx->TS_RATIO_FIELD,
+                 (int)h_tx->TS_RATED_FIELD);
+#endif
     }
 
     // record data
@@ -606,7 +804,7 @@ void MOTOR_CTRL_exit(void)
 // ------------------------------------------------------
 // Keyboard input
 // ------------------------------------------------------
-int kbhit(void)
+static int kbhit(void)
 {
     struct termios oldt, newt;
     int ch;
@@ -636,7 +834,7 @@ int kbhit(void)
 // ------------------------------------------------------
 // Keyboard control
 // ------------------------------------------------------
-void MOTOR_CTRL_key(void)
+static void MOTOR_CTRL_key(void)
 {
     if (!kbhit()) return;
 
@@ -655,6 +853,18 @@ void MOTOR_CTRL_key(void)
                 h->mode = MC_MODE_OFF;
             }
             KEY_LOG("mc mode:%s\n", mc_mode_name[h->mode]);
+
+            if (h->mode == MC_MODE_TS_ASSIST ||
+                h->mode == MC_MODE_TS_ASSIST_FRIC ||
+                h->mode == MC_MODE_TS_TOUCH_PULSE)
+
+            {
+                g_ts_bias_valid = 0;
+                g_touch_left_s = 0.0f;
+                g_ts_state.active = false;
+                g_ts_state.ts_user_filt = 0.0f;
+                KEY_LOG("TS assist mode: bias will snapshot on next step\n");
+            }
             break;
         }
 
@@ -685,6 +895,9 @@ void MOTOR_CTRL_key(void)
             h->current_offset_user = 0.0f;
             h->current_offset = 0.0f;
             h->speed_ref = 0.0f;
+
+            g_ts_state.active = false;
+            g_ts_state.ts_user_filt = 0.0f;
             break;
 
         case 'f':
@@ -729,71 +942,39 @@ void MOTOR_CTRL_key(void)
             break;
         }
 
-        // -------- Torque sensor boost toggle --------
+        // -------- Torque assist toggle --------
         case 't':
         {
             g_en_torque_boost = 0x01 - g_en_torque_boost;
             h->en_torque_boost = g_en_torque_boost;
 
-            // Reset assist state + bias capture on next step
-            g_ts_active = 0;
             g_ts_bias_valid = 0;
+            g_ts_state.active = false;
+            g_ts_state.ts_user_filt = 0.0f;
 
             KEY_LOG("en_torque_boost:%d\n", g_en_torque_boost);
             break;
         }
 
-        // increase/decrease boost gain
-        case 'u':
-            g_ts_gain_mA_per_Nm += 5.0f;
-            KEY_LOG("ts_gain: %.1f mA/Nm\n", g_ts_gain_mA_per_Nm);
-            break;
-
-        case 'i':
-            g_ts_gain_mA_per_Nm -= 5.0f;
-            if (g_ts_gain_mA_per_Nm < 0.0f) g_ts_gain_mA_per_Nm = 0.0f;
-            KEY_LOG("ts_gain: %.1f mA/Nm\n", g_ts_gain_mA_per_Nm);
-            break;
-
-        // increase/decrease max clamp
-        case 'y':
-            g_ts_max_mA += 20.0f;
-            KEY_LOG("ts_max: %.1f mA\n", g_ts_max_mA);
-            break;
-
-        case 'h':
-            g_ts_max_mA -= 20.0f;
-            if (g_ts_max_mA < 0.0f) g_ts_max_mA = 0.0f;
-            KEY_LOG("ts_max: %.1f mA\n", g_ts_max_mA);
-            break;
-
-        // force re-tare
+        // -------- Re-tare --------
         case 'r':
             g_ts_tare_done = 0;
             g_ts_zero_mN_m = 0;
+
             g_ts_bias_Nm = 0.0f;
             g_ts_bias_valid = 0;
-            g_ts_active = 0;
+
+            g_ts_state.active = false;
+            g_ts_state.ts_user_filt = 0.0f;
+
             KEY_LOG("torque sensor re-tare requested\n");
-            break;
-
-        // stiction adjust
-        case 'o':
-            g_ts_stiction_mA += 10.0f;
-            KEY_LOG("ts_stiction: %.1f mA\n", g_ts_stiction_mA);
-            break;
-
-        case 'l':
-            g_ts_stiction_mA -= 10.0f;
-            if (g_ts_stiction_mA < 0.0f) g_ts_stiction_mA = 0.0f;
-            KEY_LOG("ts_stiction: %.1f mA\n", g_ts_stiction_mA);
             break;
 
         default:
         {
             KEY_LOG("-------------------------------\n");
             KEY_LOG("press key to control motor:\n");
-            KEY_LOG("p: next mode\n");
+            KEY_LOG("p: next mode (includes TS assist modes)\n");
             KEY_LOG("w/s: current_ref +/-10, speed_ref +/-1\n");
             KEY_LOG("e/d: user offset +/-10\n");
             KEY_LOG("j/k: fric_gain +/-0.01\n");
@@ -802,10 +983,7 @@ void MOTOR_CTRL_key(void)
             KEY_LOG("q: exit\n");
             KEY_LOG("f: toggle friction comp\n");
             KEY_LOG("c: toggle fric iden\n");
-            KEY_LOG("t: torque sensor boost toggle\n");
-            KEY_LOG("u/i: ts gain +/-\n");
-            KEY_LOG("y/h: ts max +/-\n");
-            KEY_LOG("o/l: stiction +/-\n");
+            KEY_LOG("t: torque assist toggle (works in any mode)\n");
             KEY_LOG("r: re-tare\n");
             KEY_LOG("-------------------------------\n");
             break;

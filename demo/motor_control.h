@@ -1,5 +1,5 @@
 /*
- * @Author: 
+ * @Author:
  * @Date: 2025-08-06 15:58:55
  * @LastEditors: 抖音@翼之道男
  */
@@ -17,6 +17,7 @@ void MOTOR_CTRL_set_fbk_raw(txpdo_t fbk);
 
 rxpdo_t MOTOR_CTRL_get_cmd(void);
 
-extern FILE *p_file_log; // log file
+// log file handle is defined in motor_control.cpp
+extern FILE *p_file_log;
 
 #endif

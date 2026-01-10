@@ -34,12 +34,20 @@
 #include <fcntl.h>  //  include F_GETFL and F_SETFL definitions
 #include "log.h"
 #include "motor_control.h"
-#include "torque_pkt.h"
 #include "udp_pub.h"
+
+// #include "torque_pkt.h"
+// #include "udp_pub.h"
+
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <cstring>
+#include <ctime>
 
 
 // --- add this line ---
-static UdpPub g_pub;   // global UDP publisher
+// static UdpPub g_pub;   // global UDP publisher
 
 // Define constants for stack size and timing
 #define stack64k (64 * 1024) // Stack size for threads
@@ -50,6 +58,9 @@ static UdpPub g_pub;   // global UDP publisher
 /* Top of file (once) */
 static FILE *g_csv = NULL;
 static int   g_csv_decim = 0;
+
+static UdpPub g_pub;   // global UDP publisher
+
 
 
 
@@ -71,6 +82,7 @@ int erob_step_9(void);
 int erob_test(void);
 int kbhit(void);
 void key_control(void);
+
 
 
 //////////////////////////////////////////////////////////////////
@@ -282,7 +294,10 @@ int main(int argc, char **argv)
     ctime_thread = 1000;  // set cycle time to us
 
     // initialize the udp port for sending the torque sensor data
-    g_pub.init("127.0.0.1", 9999);
+    if (!g_pub.init("127.0.0.1", 9999)) {
+        perror("g_pub.init failed");
+    }
+
 
 
     // set highest real-time priority
@@ -420,9 +435,27 @@ OSAL_THREAD_FUNC_RT ecat_thread(void *ptr)
             // Iterate slaves
             for (int slave = 1; slave <= ec_slavecount; slave++)
             {
-                // Copy this slave's inputs
+
                 memcpy(&txpdo, ec_slave[slave].inputs, sizeof(txpdo_t));
 
+                // UDP publish torque (100 Hz)
+                static uint32_t pub_div = 0;
+                if (++pub_div >= 10) {                 // 1000Hz / 10 = 100Hz
+                    pub_div = 0;
+                    g_pub.send_sample(
+                        (uint16_t)slave,
+                        (int32_t)txpdo.torque_mN_m,
+                        (int16_t)txpdo.torque_ratio_pm
+                    );
+
+                    static uint32_t sent = 0;
+                    if ((++sent % 100) == 0) {
+                        ECAT_LOG("[UDP] sent torque samples: %u\n", sent);
+                    }
+                }
+
+
+                /////
                 // Pull base command
                 *h_rx = MOTOR_CTRL_get_cmd();
 
