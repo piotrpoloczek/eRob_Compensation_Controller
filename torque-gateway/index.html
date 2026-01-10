@@ -5,7 +5,7 @@
   <title>Torque Live</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 20px; }
-    .row { display:flex; gap:20px; margin-bottom:12px; flex-wrap: wrap; }
+    .row { display:flex; gap:20px; margin-bottom:12px; flex-wrap: wrap; align-items: stretch; }
     .card { padding:12px 16px; border:1px solid #ccc; border-radius:10px; min-width:220px; }
     .big { font-size: 28px; font-weight: 700; }
     .muted { color:#666; }
@@ -13,6 +13,9 @@
     canvas { width: 100%; height: 260px; display:block; }
     .wide { flex: 1 1 700px; min-width: 360px; }
     .small { flex: 0 0 auto; }
+    select { font-size: 16px; padding: 6px 8px; }
+    .legend { display:flex; gap:14px; align-items:center; margin-top:8px; }
+    .dot { width:10px; height:10px; border-radius:999px; display:inline-block; }
   </style>
 </head>
 <body>
@@ -22,15 +25,27 @@
     <div class="card small">
       <div class="muted">Status</div>
       <div id="status" class="big">disconnected</div>
+      <div style="margin-top:10px;">
+        <div class="muted">Slave</div>
+        <select id="slaveSelect"></select>
+      </div>
     </div>
+
     <div class="card small">
-      <div class="muted">Torque (Nm)</div>
-      <div id="torque" class="big">--</div>
+      <div class="muted">Torque RAW (Nm)</div>
+      <div id="torqueRaw" class="big">--</div>
     </div>
+
+    <div class="card small">
+      <div class="muted">Torque SMOOTH (Nm)</div>
+      <div id="torqueSmooth" class="big">--</div>
+    </div>
+
     <div class="card small">
       <div class="muted">Ratio (%)</div>
       <div id="ratio" class="big">--</div>
     </div>
+
     <div class="card small">
       <div class="muted">Seq</div>
       <div id="seq" class="big">--</div>
@@ -41,6 +56,12 @@
     <div class="card wide">
       <div class="muted" style="margin-bottom:8px;">Torque (last ~10s)</div>
       <canvas id="chart" width="1200" height="320"></canvas>
+
+      <div class="legend">
+        <span><span class="dot" style="background:#888;"></span> RAW</span>
+        <span><span class="dot" style="background:#111;"></span> SMOOTH</span>
+      </div>
+
       <div class="muted" id="chartInfo" style="margin-top:8px;">--</div>
     </div>
   </div>
@@ -52,11 +73,13 @@
 
 <script>
 const statusEl = document.getElementById("status");
-const torqueEl = document.getElementById("torque");
+const torqueRawEl = document.getElementById("torqueRaw");
+const torqueSmoothEl = document.getElementById("torqueSmooth");
 const ratioEl  = document.getElementById("ratio");
 const seqEl    = document.getElementById("seq");
 const rawEl    = document.getElementById("raw");
 const infoEl   = document.getElementById("chartInfo");
+const slaveSel = document.getElementById("slaveSelect");
 
 const canvas = document.getElementById("chart");
 const ctx = canvas.getContext("2d");
@@ -64,17 +87,42 @@ const ctx = canvas.getContext("2d");
 let ws;
 
 // ---- chart buffer ----
-// Keep last N points (at 100 Hz, 1000 pts = ~10s)
-const MAX_POINTS = 1000;
+const MAX_POINTS = 1000;      // at 30Hz, ~33s; at 100Hz, ~10s (we throttle to 30Hz)
 const times = [];
-const values = [];
+const rawVals = [];
+const smoothVals = [];
 
-// performance: redraw at most 30 FPS
 let needsRedraw = false;
 let lastDraw = 0;
 
+let selectedSlave = null;     // null = auto-first
+const seenSlaves = new Set();
+
+function ensureSlaveOption(slave) {
+  if (seenSlaves.has(slave)) return;
+  seenSlaves.add(slave);
+
+  const opt = document.createElement("option");
+  opt.value = String(slave);
+  opt.textContent = String(slave);
+  slaveSel.appendChild(opt);
+
+  if (selectedSlave === null) {
+    selectedSlave = slave;
+    slaveSel.value = String(slave);
+  }
+}
+
+slaveSel.addEventListener("change", () => {
+  selectedSlave = parseInt(slaveSel.value, 10);
+  // clear chart when switching slave
+  times.length = 0;
+  rawVals.length = 0;
+  smoothVals.length = 0;
+  needsRedraw = true;
+});
+
 function resizeCanvasToCSS() {
-  // Make the internal canvas match the rendered size for crisp lines
   const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
   const w = Math.max(300, Math.floor(rect.width * dpr));
@@ -84,47 +132,57 @@ function resizeCanvasToCSS() {
     canvas.height = h;
   }
 }
-
 window.addEventListener("resize", () => { resizeCanvasToCSS(); drawChart(); });
 
-function pushPoint(tSec, v) {
+function pushPoint(tSec, raw, smooth) {
   times.push(tSec);
-  values.push(v);
+  rawVals.push(raw);
+  smoothVals.push(smooth);
+
   if (times.length > MAX_POINTS) {
-    times.shift();
-    values.shift();
+    times.shift(); rawVals.shift(); smoothVals.shift();
   }
   needsRedraw = true;
 }
 
 function niceGridStep(range) {
-  // choose 1/2/5 * 10^k
   if (range <= 0) return 1;
-  const raw = range / 5; // aim ~5 grid lines
+  const raw = range / 5;
   const k = Math.pow(10, Math.floor(Math.log10(raw)));
   const r = raw / k;
   const step = (r < 1.5) ? 1*k : (r < 3.5) ? 2*k : (r < 7.5) ? 5*k : 10*k;
   return step;
 }
 
+function drawLine(vals, tMin, tMax, vMin, vMax, padL, padT, plotW, plotH) {
+  const n = vals.length;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = padL + ((times[i] - tMin) / (tMax - tMin)) * plotW;
+    const y = padT + (1 - (vals[i] - vMin) / (vMax - vMin)) * plotH;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
 function drawChart() {
   resizeCanvasToCSS();
   const w = canvas.width, h = canvas.height;
 
-  // background
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, w, h);
 
-  const n = values.length;
+  const n = rawVals.length;
   if (n < 2) {
     ctx.fillStyle = "#666";
     ctx.font = `${Math.floor(14 * (window.devicePixelRatio||1))}px system-ui`;
     ctx.fillText("waiting for data…", 16, 24);
+    infoEl.textContent = "--";
     return;
   }
 
-  // padding
   const padL = 60, padR = 20, padT = 16, padB = 28;
   const plotW = w - padL - padR;
   const plotH = h - padT - padB;
@@ -134,23 +192,24 @@ function drawChart() {
 
   let vMin = Infinity, vMax = -Infinity;
   for (let i = 0; i < n; i++) {
-    const v = values[i];
-    if (v < vMin) vMin = v;
-    if (v > vMax) vMax = v;
+    const a = rawVals[i], b = smoothVals[i];
+    if (a < vMin) vMin = a;
+    if (a > vMax) vMax = a;
+    if (b < vMin) vMin = b;
+    if (b > vMax) vMax = b;
   }
-  // add headroom
+
   const span = (vMax - vMin) || 1;
   vMin -= span * 0.1;
   vMax += span * 0.1;
 
-  // grid
   const step = niceGridStep(vMax - vMin);
   const gridMin = Math.floor(vMin / step) * step;
   const gridMax = Math.ceil(vMax / step) * step;
 
+  // grid
   ctx.strokeStyle = "#e9e9e9";
   ctx.lineWidth = 1;
-
   ctx.fillStyle = "#666";
   ctx.font = `${Math.floor(12 * (window.devicePixelRatio||1))}px system-ui`;
 
@@ -160,8 +219,6 @@ function drawChart() {
     ctx.moveTo(padL, y);
     ctx.lineTo(padL + plotW, y);
     ctx.stroke();
-
-    // labels
     ctx.fillText(gv.toFixed(2), 6, y + 4);
   }
 
@@ -170,34 +227,22 @@ function drawChart() {
   ctx.lineWidth = 1;
   ctx.strokeRect(padL, padT, plotW, plotH);
 
-  // line
-  ctx.strokeStyle = "#111";
+  // RAW line (light)
+  ctx.strokeStyle = "#888";
   ctx.lineWidth = 2;
-  ctx.beginPath();
+  drawLine(rawVals, tMin, tMax, vMin, vMax, padL, padT, plotW, plotH);
 
-  for (let i = 0; i < n; i++) {
-    const x = padL + ((times[i] - tMin) / (tMax - tMin)) * plotW;
-    const y = padT + (1 - (values[i] - vMin) / (vMax - vMin)) * plotH;
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
+  // SMOOTH line (dark)
+  ctx.strokeStyle = "#111";
+  ctx.lineWidth = 3;
+  drawLine(smoothVals, tMin, tMax, vMin, vMax, padL, padT, plotW, plotH);
 
-  // last point marker
-  const xLast = padL + plotW;
-  const yLast = padT + (1 - (values[n-1] - vMin) / (vMax - vMin)) * plotH;
-  ctx.fillStyle = "#111";
-  ctx.beginPath();
-  ctx.arc(xLast, yLast, 4, 0, Math.PI * 2);
-  ctx.fill();
-
-  // time label
   const secondsShown = (tMax - tMin);
-  infoEl.textContent = `points: ${n} | window: ~${secondsShown.toFixed(1)} s | y-range: ${vMin.toFixed(2)} … ${vMax.toFixed(2)} Nm`;
+  infoEl.textContent =
+    `slave: ${selectedSlave} | points: ${n} | window: ~${secondsShown.toFixed(1)} s | y-range: ${vMin.toFixed(2)} … ${vMax.toFixed(2)} Nm`;
 }
 
 function animationLoop(ts) {
-  // redraw at most ~30 fps
   if (needsRedraw && (ts - lastDraw) > 33) {
     drawChart();
     needsRedraw = false;
@@ -222,14 +267,25 @@ function connect() {
     const msg = JSON.parse(ev.data);
     if (msg.hello) return;
 
-    torqueEl.textContent = msg.torque_Nm.toFixed(3);
-    ratioEl.textContent  = msg.ratio_pct.toFixed(1);
-    seqEl.textContent    = msg.seq;
+    ensureSlaveOption(msg.slave);
+
+    // filter by selected slave
+    if (selectedSlave !== null && msg.slave !== selectedSlave) return;
+
+    const rawNm = (typeof msg.torque_Nm === "number") ? msg.torque_Nm : null;
+    const smNm  = (typeof msg.torque_Nm_smooth === "number") ? msg.torque_Nm_smooth : rawNm;
+
+    if (rawNm === null) return;
+
+    torqueRawEl.textContent = rawNm.toFixed(3);
+    torqueSmoothEl.textContent = smNm.toFixed(3);
+    ratioEl.textContent  = (msg.ratio_pct ?? 0).toFixed(1);
+    seqEl.textContent    = msg.seq ?? "--";
     rawEl.textContent    = JSON.stringify(msg, null, 2);
 
-    // use msg.ts (unix seconds) if provided, otherwise local time
-    const t = (typeof msg.ts === "number") ? msg.ts : (Date.now() / 1000);
-    pushPoint(t, msg.torque_Nm);
+    // prefer relative time from gateway (stable + avoids large unix values)
+    const t = (typeof msg.t_rel_s === "number") ? msg.t_rel_s : (Date.now() / 1000);
+    pushPoint(t, rawNm, smNm);
   };
 }
 

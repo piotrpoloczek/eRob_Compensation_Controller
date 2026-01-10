@@ -3,3 +3,8 @@
 build
 
 node_modules
+
+
+./torque-gateway/torque_log.csv
+
+torque-gateway/torque_log.csv

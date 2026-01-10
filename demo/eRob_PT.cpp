@@ -167,6 +167,88 @@ static float clampf(float x, float lo, float hi) {
     return x;
 }
 
+// ---------------- Torque smoothing ----------------
+#ifndef TORQ_MAX_SLAVES
+#define TORQ_MAX_SLAVES 16
+#endif
+
+struct TorqueSmoothState {
+    int32_t buf_mNm[5];
+    int     n = 0;
+    int     idx = 0;
+
+    float   ema_Nm = 0.0f;
+    float   out_Nm = 0.0f;
+
+    double  last_t_sec = 0.0;
+    bool    init = false;
+};
+
+static TorqueSmoothState torq_f[TORQ_MAX_SLAVES] = {};
+
+
+static inline void sort_int32(int32_t *a, int n) {
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (a[j] < a[i]) { int32_t t = a[i]; a[i] = a[j]; a[j] = t; }
+        }
+    }
+}
+
+static inline float torque_smooth_update(
+    TorqueSmoothState &st,
+    int32_t torque_comp_mNm,   // torque with tare removed, in mN·m
+    double  t_sec,             // time source (DC time recommended)
+    float   ema_tau_s,         // e.g. 0.20f
+    float   max_step_Nm        // e.g. 1.5f per sample OR see note below
+) {
+    // 1) push into median buffer
+    st.buf_mNm[st.idx] = torque_comp_mNm;
+    st.idx = (st.idx + 1) % 5;
+    if (st.n < 5) st.n++;
+
+    // 2) median of available samples
+    int32_t tmp[5];
+    for (int i = 0; i < st.n; i++) tmp[i] = st.buf_mNm[i];
+    sort_int32(tmp, st.n);
+    int32_t med_mNm = tmp[st.n / 2];
+    float med_Nm = (float)med_mNm / 1000.0f;
+
+    // 3) init on first sample
+    if (!st.init) {
+        st.init = true;
+        st.ema_Nm = med_Nm;
+        st.out_Nm = med_Nm;
+        st.last_t_sec = t_sec;
+        return st.out_Nm;
+    }
+
+    // 4) time-based EMA
+    double dt = t_sec - st.last_t_sec;
+    if (dt < 0.0) dt = 0.0;
+    if (dt > 0.1) dt = 0.1; // clamp (in case of pauses)
+    st.last_t_sec = t_sec;
+
+    float alpha = 0.0f;
+    if (ema_tau_s > 1e-6f) {
+        alpha = (float)(dt / (ema_tau_s + dt));
+    } else {
+        alpha = 1.0f;
+    }
+    st.ema_Nm = st.ema_Nm + alpha * (med_Nm - st.ema_Nm);
+
+    // 5) step limiter (prevents spikes)
+    float target = st.ema_Nm;
+    float lo = st.out_Nm - max_step_Nm;
+    float hi = st.out_Nm + max_step_Nm;
+    if (target < lo) target = lo;
+    if (target > hi) target = hi;
+
+    st.out_Nm = target;
+    return st.out_Nm;
+}
+
+
 
 static void gym_tare_update(int32_t torque_mNm_raw)
 {
@@ -436,24 +518,44 @@ OSAL_THREAD_FUNC_RT ecat_thread(void *ptr)
             for (int slave = 1; slave <= ec_slavecount; slave++)
             {
 
+                // 1) Read inputs FIRST
                 memcpy(&txpdo, ec_slave[slave].inputs, sizeof(txpdo_t));
 
-                // UDP publish torque (100 Hz)
+                // 2) Time source already computed as t_sec above
+                const int32_t torque_raw_mNm  = txpdo.torque_mN_m;
+                const int32_t torque_comp_mNm = torque_raw_mNm - g_torque_zero_mNm;
+
+                int si = slave;
+                if (si < 0) si = 0;
+                if (si >= TORQ_MAX_SLAVES) si = TORQ_MAX_SLAVES - 1;
+
+                const float EMA_TAU_S    = 0.20f;
+                const float MAX_STEP_NM  = 1.5f;
+
+                float torque_smooth_Nm = torque_smooth_update(
+                    torq_f[si],
+                    torque_comp_mNm,
+                    t_sec,
+                    EMA_TAU_S,
+                    MAX_STEP_NM
+                );
+
+                const int32_t torque_smooth_mNm = (int32_t)lroundf(torque_smooth_Nm * 1000.0f);
+
+                // 3) UDP publish (100 Hz)
                 static uint32_t pub_div = 0;
-                if (++pub_div >= 10) {                 // 1000Hz / 10 = 100Hz
+                if (++pub_div >= 10) {
                     pub_div = 0;
-                    g_pub.send_sample(
+
+                    // If txpdo.torque_ratio_pm is already "tenths of percent", pass it directly:
+                    g_pub.send_sample_v2(
                         (uint16_t)slave,
-                        (int32_t)txpdo.torque_mN_m,
-                        (int16_t)txpdo.torque_ratio_pm
+                        torque_raw_mNm,
+                        torque_smooth_mNm,
+                        (int16_t)txpdo.torque_ratio_pm,
+                        (uint64_t)(t_sec * 1e9)   // optional; or pass 0 to use now_ns()
                     );
-
-                    static uint32_t sent = 0;
-                    if ((++sent % 100) == 0) {
-                        ECAT_LOG("[UDP] sent torque samples: %u\n", sent);
-                    }
                 }
-
 
                 /////
                 // Pull base command
