@@ -85,6 +85,24 @@ void key_control(void);
 
 
 
+// --- Baseline tracking + band (Nm) ---
+static float g_base_track_alpha      = 0.02f; // how fast baseline follows when "quiet"
+static float g_base_on_delta_Nm      = 0.5f;  // trigger boost if |T - base| > this
+static float g_base_off_delta_Nm     = 0.45f;  // stop boost when |T - base| < this (hysteresis)
+
+
+
+
+// ---- Stiction compensation tuning ----
+static float g_stiction_vel_dead_dps   = 0.5f;   // stationary if |vel| < this
+static float g_stiction_intent_Nm      = 0.15f;  // user intent threshold
+static float g_stiction_boost_Nm       = 0.35f;  // extra breakaway torque
+static float g_stiction_gain           = 0.8f;   // proportional assist from user torque
+static float g_stiction_max_assist_Nm  = 1.2f;   // clamp assist
+static float g_stiction_ramp_Nm_step   = 0.03f;  // Nm per cycle (1000 Hz => 30 Nm/s)
+
+
+
 //////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////
@@ -590,51 +608,98 @@ OSAL_THREAD_FUNC_RT ecat_thread(void *ptr)
 
                     else if (g_gym_mode == GYM_RESIST) {
 
-                        // 1) Read raw velocity (as you already do)
+                        // 1) Read velocity
                         const int32_t vel_cnt = txpdo.actual_velocity;
                         const float vel_dps_raw = vel_cnt * Cnt_to_deg;
 
-                        // 2) Small smoothing for velocity
-                        static float vel_dps_f = 0.0f;
+                        // 2) Per-slave smoothing
+                        static float vel_f[TORQ_MAX_SLAVES] = {0};
                         const float alpha_v = 0.10f;
-                        vel_dps_f = vel_dps_f + alpha_v * (vel_dps_raw - vel_dps_f);
+                        vel_f[si] = vel_f[si] + alpha_v * (vel_dps_raw - vel_f[si]);
 
-                        // 3) User torque (already compensated around tare in your logic)
-                        // If torque_comp_Nm() already subtracts tare, great.
-                        // If not, use: torque_user = (txpdo.torque_mN_m - g_tare_mNm) * 1e-3;
-                        float torque_user = (float)torque_comp_Nm(txpdo.torque_mN_m);
+                        // 3) Smoothed user torque from sensor (Nm)
+                        // Use your compensated sensor value (tare removed)
+                        float T_user = (float)torque_comp_Nm(txpdo.torque_mN_m);
 
-                        // 4) Filter torque a bit (faster than velocity filter)
-                        static float torque_f = 0.0f;
+                        // 4) Filter torque
+                        static float T_user_f[TORQ_MAX_SLAVES] = {0};
                         const float alpha_t = 0.20f;
-                        torque_f = torque_f + alpha_t * (torque_user - torque_f);
+                        T_user_f[si] = T_user_f[si] + alpha_t * (T_user - T_user_f[si]);
 
-                        // 5) Intent thresholds
-                        const float T_intent_Nm = 0.6f;   // start feeling you
-                        const float T_release_Nm = 0.3f;  // hysteresis to avoid chatter
+                        // 5) Baseline tracker (learn "base" when still and not boosting)
+                        static float T_base[TORQ_MAX_SLAVES] = {0};
+                        static uint8_t T_base_valid[TORQ_MAX_SLAVES] = {0};
 
-                        static bool intent = false;
-                        if (!intent && fabsf(torque_f) > T_intent_Nm) intent = true;
-                        if ( intent && fabsf(torque_f) < T_release_Nm) intent = false;
+                        const bool stationary = (fabsf(vel_f[si]) < g_stiction_vel_dead_dps);
 
-                        // 6) Build resist torque
-                        float T_gym = 0.0f;
-
-                        if (intent) {
-                            const float sgn = (torque_f > 0) ? 1.0f : -1.0f;
-
-                            // "Coulomb-like" term triggered by torque intent
-                            T_gym += -(g_gym_const_Nm * sgn);
-
-                            // Viscous term still tied to actual motion
-                            T_gym += -(g_gym_visc_Nm_s * vel_dps_f);
+                        // init baseline once (first time we’re stationary)
+                        if (!T_base_valid[si] && stationary) {
+                            T_base[si] = T_user_f[si];
+                            T_base_valid[si] = 1;
                         }
 
-                        T_gym = clampf(T_gym, -g_gym_max_Nm, +g_gym_max_Nm);
+                        // 6) Delta from baseline
+                        float dT = T_user_f[si] - T_base[si];
+                        float abs_dT = fabsf(dT);
 
-                        const int16_t T_cmd_mNm = (int16_t)lroundf(T_gym * 1000.0f);
-                        h_rx->target_torque = T_cmd_mNm;
+                        // 7) Band/hysteresis state (per slave)
+                        static bool boost_active[TORQ_MAX_SLAVES] = {false};
+
+                        if (!boost_active[si]) {
+                            if (stationary && T_base_valid[si] && abs_dT > g_base_on_delta_Nm) {
+                                boost_active[si] = true;
+                            }
+                        } else {
+                            if (!stationary || abs_dT < g_base_off_delta_Nm) {
+                                boost_active[si] = false;
+                            }
+                        }
+
+                        // 8) Update baseline ONLY when not actively boosting (so baseline doesn’t “chase” the push)
+                        if (stationary && T_base_valid[si] && !boost_active[si]) {
+                            T_base[si] = (1.0f - g_base_track_alpha) * T_base[si] + g_base_track_alpha * T_user_f[si];
+                            // recompute after baseline update (optional)
+                            dT = T_user_f[si] - T_base[si];
+                            abs_dT = fabsf(dT);
+                        }
+
+                        // 9) Compute command torque
+                        float T_cmd = 0.0f;
+
+                        if (boost_active[si] && stationary) {
+                            // direction = sign of delta from baseline (not sign of raw torque)
+                            const float sgn = (dT >= 0.0f) ? 1.0f : -1.0f;
+
+                            // your stiction “kick” + proportional assist (based on delta)
+                            T_cmd = (g_stiction_gain * dT) + (sgn * g_stiction_boost_Nm);
+                            T_cmd = clampf(T_cmd, -g_stiction_max_assist_Nm, +g_stiction_max_assist_Nm);
+
+                        } else {
+                            // your normal resist logic when moving (or zero, up to you)
+                            float T_gym = 0.0f;
+
+                            if (fabsf(vel_f[si]) > g_stiction_vel_dead_dps) {
+                                const float sgn_v = (vel_f[si] >= 0.0f) ? 1.0f : -1.0f;
+                                T_gym += -(g_gym_const_Nm * sgn_v);
+                                T_gym += -(g_gym_visc_Nm_s * vel_f[si]);
+                            }
+
+                            T_cmd = clampf(T_gym, -g_gym_max_Nm, +g_gym_max_Nm);
+                        }
+
+                        // 10) Ramp limit (per slave)
+                        static float T_cmd_f[TORQ_MAX_SLAVES] = {0};
+                        float lo = T_cmd_f[si] - g_stiction_ramp_Nm_step;
+                        float hi = T_cmd_f[si] + g_stiction_ramp_Nm_step;
+                        if (T_cmd < lo) T_cmd = lo;
+                        if (T_cmd > hi) T_cmd = hi;
+                        T_cmd_f[si] = T_cmd;
+
+                        // 11) Output
+                        h_rx->target_torque = (int16_t)lroundf(T_cmd_f[si] * 1000.0f);
+
                     }
+
 
 
                     // -------------

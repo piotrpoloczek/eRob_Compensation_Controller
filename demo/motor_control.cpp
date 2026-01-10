@@ -663,7 +663,7 @@ void MOTOR_CTRL_step(float dt)
                 g_touch_left_s -= h->dt_2;
                 if (g_touch_left_s < 0.0f) g_touch_left_s = 0.0f;
 
-                g_touch_left_s = g_touch_pulse_s;
+                // g_touch_left_s = g_touch_pulse_s;
                 g_touch_sign = signf_local(h->torque_user_Nm);
                 boost = g_touch_sign * g_touch_pulse_mA;
 
